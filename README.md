@@ -1,4 +1,8 @@
 # SmartStall_API
+
+docs/smartstall_product_img.png
+
+
 # SmartStall Bluetooth Peripheral API
 
 This document describes the public-facing **Bluetooth GATT API** for the SmartStall touchless locking system. It is intended for developers building Bluetooth central clients (e.g., ESP32-based hubs) that connect to SmartStall peripherals.
@@ -11,15 +15,28 @@ The SmartStall device is a Bluetooth Low Energy (BLE) peripheral. It advertises 
 
 ---
 
-## Service Overview
+## GATT Service Overview
 
-| Name               | UUID                                   | Type     |
-|--------------------|----------------------------------------|----------|
-| SmartStall Service | `c56a1b98-6c1e-413a-b138-0e9f320c7e8b` | Primary  |
+- **Service UUID**: `c56a1b98-6c1e-413a-b138-0e9f320c7e8b`
+- **Characteristics**:
+
+| Characteristic        | UUID                                    | Type     | Description                                                                 |
+|-----------------------|------------------------------------------|----------|-----------------------------------------------------------------------------|
+| Device ID             | `34e6784c-bf53-41d5-a090-7c123d5c1b78`   | `READ`   | 6-byte unique hardware ID read from the NRF52’s FICR register.              |
+| Stall Status          | `47d80a44-c552-422b-aa3b-d250ed04be37`   | `READ+NOTIFY` | Indicates current lock state (e.g., INIT, LOCKED, SLEEP).             |
+| Battery Voltage (mV)  | `7d108dc9-4aaf-4a38-93e3-d9f8ff139f11`   | `READ+NOTIFY` | Battery voltage as an unsigned 16-bit integer in millivolts.         |
 
 ---
 
 ## Characteristics
+
+## Device ID
+
+The `Device ID` is a 6-byte unique identifier derived from the NRF52840’s factory info configuration registers (`FICR->DEVICEID`).
+- Use this ID to differentiate between deployed SmartStall devices.
+- Value is fixed for each device.
+
+---
 
 ### 🟦 Stall Status
 
@@ -49,6 +66,7 @@ The SmartStall device is a Bluetooth Low Energy (BLE) peripheral. It advertises 
 
 > Battery voltage is measured at boot and sent via notification.
 
+> Example: `4910mV` → `4.910V`
 ---
 
 ## Notifications
@@ -64,28 +82,33 @@ To receive real-time updates:
 
 ---
 
-## Advertising Data
+## BLE Advertisement
 
-SmartStall advertises the 128-bit service UUID:
+- The SmartStall peripheral advertises with:
+  - Connectable mode
+  - Its 128-bit service UUID
 
-```c
-const struct bt_data ad[] = {
-    BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
-    BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_STALL_SERVICE_VAL),
-};
-```
+## Interaction Workflow
+
+1. Central (hub) scans and connects to a SmartStall peripheral.
+2. Reads the `Device ID` once.
+3. Subscribes to notifications for `Stall Status` and `Battery Voltage`.
+4. Waits for updates:
+   - Stall open, lock, unlock events
+   - 20-minute timeout alert (possible emergency)
+   - Battery level changes (optional monitoring)
 
 ---
 
-## Getting Started (Central)
+## Example Usage (ESP32)
 
-To integrate with SmartStall:
-
-1. Scan for advertising packets containing `c56a1b98-6c1e-413a-b138-0e9f320c7e8b`
-2. Connect to the peripheral
-3. Discover the service and characteristics
-4. Subscribe to notifications on both UUIDs
-5. Handle `uint16_t` values accordingly in your app logic
+```cpp
+// Pseudocode to read GATT values
+connectToSmartStall();
+read(deviceID);
+subscribe(stallStatus);
+subscribe(batteryVoltage);
+```
 
 ---
 
