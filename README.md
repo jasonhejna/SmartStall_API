@@ -1,7 +1,7 @@
 # SmartStall_API
 
-docs/smartstall_product_img.png
 
+![image](docs/smartstall_product_img.png)
 
 # SmartStall Bluetooth Peripheral API
 
