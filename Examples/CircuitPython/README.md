@@ -71,12 +71,5 @@ Example Output:
 - Trigger alerts if no unlock occurs within 20 minutes
 
 ## 👁️ Resources
-- [SmartStall GATT API](../SmartStall_API.md) (defines peripheral behavior)
+- [SmartStall GATT API](../../README.md) (defines peripheral behavior)
 - [Adafruit BLE Docs](https://docs.circuitpython.org/projects/ble/en/latest/)
-
-## 🎓 License
-MIT License.
-
----
-
-Built by [Sum Hydration](https://www.sumhydration.com) for hygienic and accessible public restrooms.
