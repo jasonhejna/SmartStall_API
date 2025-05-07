@@ -11,8 +11,6 @@ The SmartStall device is a Bluetooth Low Energy (BLE) peripheral. It advertises 
 - Stall lock state (enum values)
 - Battery voltage (in millivolts)
 
-> ⚠️ The SmartStall system is intended for use in bathrooms. After 20 minutes of being locked without activity, the device enters sleep mode and updates the central. This may indicate a medical issue with the user.
-
 ---
 
 ## GATT Service Overview
@@ -54,7 +52,7 @@ The `Device ID` is a 6-byte unique identifier derived from the NRF52840’s fact
 | `3`   | `STATE_UNLOCK`   | Stall has been unlocked                             |
 | `4`   | `STATE_SLEEP`    | 20-minute timeout occurred, entering sleep mode     |
 
-> 💡 Central clients can subscribe to receive `NOTIFY` events on status change.
+> 💡 Central clients can subscribe to receive `NOTIFY` events on status change. Since SmartStall doesn't keep time, the hub will be responsible for generating timestamps.
 
 ### 🟩 Battery Voltage
 
