@@ -18,23 +18,15 @@ The SmartStall device is a Bluetooth Low Energy (BLE) peripheral. It advertises 
 - **Service UUID**: `c56a1b98-6c1e-413a-b138-0e9f320c7e8b`
 - **Characteristics**:
 
-| Characteristic        | UUID                                    | Type     | Description                                                                 |
-|-----------------------|------------------------------------------|----------|-----------------------------------------------------------------------------|
-| Device ID             | `34e6784c-bf53-41d5-a090-7c123d5c1b78`   | `READ`   | 6-byte unique hardware ID read from the NRF52’s FICR register.              |
-| Stall Status          | `47d80a44-c552-422b-aa3b-d250ed04be37`   | `READ+NOTIFY` | Indicates current lock state (e.g., INIT, LOCKED, SLEEP).             |
-| Battery Voltage (mV)  | `7d108dc9-4aaf-4a38-93e3-d9f8ff139f11`   | `READ+NOTIFY` | Battery voltage as an unsigned 16-bit integer in millivolts.         |
+| Characteristic        | UUID                                    | Type          | Description                                                                 |
+|-----------------------|-----------------------------------------|---------------|-----------------------------------------------------------------------------|
+| Stall Status          | `47d80a44-c552-422b-aa3b-d250ed04be37`  | `READ+NOTIFY` | Indicates current lock state (e.g., INIT, LOCKED, SLEEP).                   |
+| Battery Voltage (mV)  | `7d108dc9-4aaf-4a38-93e3-d9f8ff139f11`  | `READ+NOTIFY` | Battery voltage as an unsigned 16-bit integer in millivolts.                |
 
+> Bluetooth MAC address of the SmartStall device is not exposed in the GATT profile. Use the 6-byte Device ID (MAC address) for identification.
 ---
 
 ## Characteristics
-
-## Device ID
-
-The `Device ID` is a 6-byte unique identifier derived from the NRF52840’s factory info configuration registers (`FICR->DEVICEID`).
-- Use this ID to differentiate between deployed SmartStall devices.
-- Value is fixed for each device.
-
----
 
 ### 🟦 Stall Status
 
@@ -50,7 +42,11 @@ The `Device ID` is a 6-byte unique identifier derived from the NRF52840’s fact
 | `1`   | `STATE_INIT`     | Device booted, reporting initialization             |
 | `2`   | `STATE_LOCKED`   | Stall is physically locked                          |
 | `3`   | `STATE_UNLOCK`   | Stall has been unlocked                             |
-| `4`   | `STATE_SLEEP`    | 20-minute timeout occurred, entering sleep mode     |
+| `4`   | `STATE_OPEN`     | Stall door has been opened                          |
+| `5`   | `STATE_CLOSED`   | Stall door has been closed                          |
+| `6`   | `STATE_SLEEP`    | Entering sleep mode                                 |
+| `7`   | `LOCK_TIMEOUT`   | 20-minute timeout occurred                          |
+| `8`   | `LOW_BATT`       | Battery too low to operate                          |
 
 > 💡 Central clients can subscribe to receive `NOTIFY` events on status change. Since SmartStall doesn't keep time, the hub will be responsible for generating timestamps.
 
