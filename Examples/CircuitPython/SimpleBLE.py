@@ -1,33 +1,9 @@
 import time
-import board
-import displayio
-import terminalio
-from adafruit_display_text import label
-from adafruit_qualia.graphics import Graphics, Displays
 from smartstall_service import SmartStallService
 from adafruit_ble import BLERadio
 from adafruit_ble.advertising.standard import ProvideServicesAdvertisement
 from struct import unpack
 
-# Initialize display
-graphics = Graphics(Displays.ROUND21, default_bg=0x000000)
-display = graphics.display
-
-# Create a main display group
-main_group = displayio.Group()
-display.root_group = main_group
-
-# Add status label
-display_label = label.Label(
-    terminalio.FONT,
-    text="SmartStall Display OK",
-    color=0x00FF00,
-    x=90,
-    y=display.height // 2
-)
-main_group.append(display_label)
-
-# BLE setup
 ble = BLERadio()
 known_addresses = {}  # {address_string: address_obj}
 
@@ -40,6 +16,7 @@ def scan_for_smartstalls(timeout=5):
                 print(f"✅ New SmartStall Found: {addr_str} (RSSI: {adv.rssi})")
                 known_addresses[addr_str] = adv
     ble.stop_scan()
+
 
 def connect_and_read(addr_str, adv_obj):
     print(f"🔗 Connecting to {addr_str}...")
@@ -56,6 +33,11 @@ def connect_and_read(addr_str, adv_obj):
             raise RuntimeError("SmartStallService not found.")
 
         print("🔍 SmartStallService found. Reading characteristics...")
+        print(f"  → stall_status: {stall_service.stall_status}")
+        print(f"  → battery_voltage: {stall_service.battery_voltage}")
+        print(f"  → reference_switch: {stall_service.reference_switch}")
+
+        # Unpack data
         stall_status = unpack("<H", stall_service.stall_status)[0]
         battery_voltage = unpack("<H", stall_service.battery_voltage)[0]
         ref_switch = unpack("<B", stall_service.reference_switch)[0]
@@ -64,16 +46,13 @@ def connect_and_read(addr_str, adv_obj):
         print(f"🔹 Battery Voltage: {battery_voltage} mV")
         print(f"🔹 Reference Switch State: {ref_switch}")
 
-        display_label.text = (f"{addr_str}\nStatus: {stall_status}"
-                              f"\nBatt: {battery_voltage}mV\nRef: {ref_switch}")
-
     except Exception as e:
         print(f"❌ Failed to read from {addr_str}: {e}")
-        display_label.text = f"Error: {e}"
     finally:
         if connection and connection.connected:
             connection.disconnect()
             print("🔌 Disconnected.")
+
 
 # Main polling loop
 known_keys = list(known_addresses.keys())
@@ -83,7 +62,7 @@ while True:
     scan_for_smartstalls()
 
     if known_addresses:
-        known_keys = list(known_addresses.keys())
+        known_keys = list(known_addresses.keys())  # Refresh in case new devices added
         addr_str = known_keys[current_index % len(known_keys)]
         adv_obj = known_addresses[addr_str]
 
@@ -91,7 +70,6 @@ while True:
         connect_and_read(addr_str, adv_obj)
         current_index += 1
     else:
-        display_label.text = "⏳ No SmartStalls found"
         print("⏳ No SmartStall devices known yet.")
 
     time.sleep(10)
