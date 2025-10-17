@@ -5,7 +5,7 @@
         "*.ino": "cpp"
     },
     "idf.pythonInstallPath": "c:\\Users\\jason\\.espressif\\tools\\idf-python\\3.8.7\\python.exe",
-    "particle.targetDevice": "0a10aced202194944a071e08",
+    "particle.targetDevice": "0a10aced202194944a071398",
     "particle.targetPlatform": "msom",
-    "particle.firmwareVersion": "6.2.1"
+    "particle.firmwareVersion": "6.3.3"
 }

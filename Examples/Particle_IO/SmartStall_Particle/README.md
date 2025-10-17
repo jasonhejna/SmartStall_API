@@ -34,7 +34,13 @@ c56a1b98-6c1e-413a-b138-0e9f320c7e8b
 Characteristics:
 1. Stall Status (`47d80a44-c552-422b-aa3b-d250ed04be37`)
    - Format: `uint16_t`
-   - Values: 0=UNKNOWN, 1=INIT, 2=LOCKING, 3=UNLOCKING, 4=SLEEP, 5=MANUAL_LOCK
+   - Values:
+     - 0 = UNKNOWN (Initial/undefined state)
+     - 1 = INIT (System initializing or idle)
+     - 2 = LOCKED (Active locking sequence)
+     - 3 = UNLOCKED (Active unlocking sequence)
+     - 4 = SLEEP (Entering deep sleep mode)
+     - 5 = 20_MINUTE_ALERT (Locked for 20 minutes or more; safety alert)
 2. Battery Voltage (`7d108dc9-4aaf-4a38-93e3-d9f8ff139f11`)
    - Format: `uint16_t` millivolts
 3. Sensor Counts (`3e4a9f12-7b5c-4d8e-a1b2-9c8d7e6f5a4b`)
@@ -45,21 +51,26 @@ Each poll cycle resets characteristic handles before discovery to prevent accide
 ## Cloud Event Stream
 
 ### `smartstall/data`
-Single consolidated JSON payload published once per successful device poll:
+Single consolidated JSON payload published when the stall status changes (no publish on unchanged status). Includes derived occupancy field:
+
+- occupied (boolean)
+
+Occupancy mapping: 0/1/3/4 → non-occupied, 2/5 → occupied.
 
 ```json
 {
-  "device": "AA:BB:CC:DD:EE:FF",
-  "timestamp": 1696118400,
-  "status": 2,
-  "status_name": "LOCKING",
-  "battery_mv": 3700,
-  "battery_v": 3.70,
-  "sensor_counts": {
-    "limit_switch": 150,
-    "ir_sensor": 89,
-    "hall_sensor": 145
-  }
+   "device": "AA:BB:CC:DD:EE:FF",
+   "timestamp": 1696118400,
+   "status": 2,
+   "status_name": "LOCKED",
+   "occupied": true,
+   "battery_mv": 3700,
+   "battery_v": 3.70,
+   "sensor_counts": {
+      "limit_switch": 150,
+      "ir_sensor": 89,
+      "hall_sensor": 145
+   }
 }
 ```
 
@@ -96,7 +107,7 @@ If consecutive read/connect failures accrue (tracked via `failureCount`):
    ```bash
    particle subscribe smartstall
    ```
-5. Expect a single `smartstall/data` event per successful poll per device.
+5. Expect a `smartstall/data` event only when a device's status changes.
 
 ## Adjusting Behavior
 

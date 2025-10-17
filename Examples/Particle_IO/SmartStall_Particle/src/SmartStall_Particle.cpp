@@ -12,6 +12,8 @@
 // Include Particle Device OS APIs
 #include "Particle.h"
 
+PRODUCT_VERSION(1);
+
 // Let Device OS manage the connection to the Particle Cloud
 SYSTEM_MODE(AUTOMATIC);
 
@@ -43,6 +45,8 @@ struct DeviceInfo {
     unsigned long lastSeen;   // last time seen in a scan
     unsigned long lastRead;   // last time we successfully read data
     uint8_t failureCount;     // consecutive failures
+    bool hasLastStatus;       // whether we have published a status before
+    uint16_t lastStatusPublished; // last status value we published
 };
 
 Vector<DeviceInfo> knownDevices;
@@ -87,6 +91,8 @@ void registerOrUpdateDevice(const BleAddress &addr) {
         d.lastSeen = millis();
         d.lastRead = 0;
         d.failureCount = 0;
+        d.hasLastStatus = false;
+        d.lastStatusPublished = 0;
         knownDevices.append(d);
         Log.info("Added new SmartStall device to registry (%d total): %s", knownDevices.size(), addr.toString().c_str());
     }
@@ -163,12 +169,12 @@ SmartStallData currentData;
 // Status value definitions
 const char* getStatusString(uint16_t status) {
     switch(status) {
-        case 0: return "UNKNOWN";
-        case 1: return "INIT";
-        case 2: return "LOCKED";
-        case 3: return "UNLOCKING";
-        case 4: return "SLEEP";
-        case 5: return "MANUAL_LOCK";
+        case 0: return "UNKNOWN";             // Initial/undefined state
+        case 1: return "INIT";                // System initializing or idle
+        case 2: return "LOCKED";              // Active locking sequence
+        case 3: return "UNLOCKED";            // Active unlocking sequence
+        case 4: return "SLEEP";               // Entering deep sleep mode
+        case 5: return "20_MINUTE_ALERT";     // Locked for 20+ minutes (safety alert)
         default: return "INVALID";
     }
 }
@@ -189,6 +195,18 @@ void setup() {
     
     // Initialize BLE
     BLE.on();
+    // Increase BLE transmit power to improve range (max +8 dBm on nRF52840)
+    if (BLE.setTxPower(8)) {
+        Log.info("BLE TX power set to +8 dBm");
+    } else {
+        Log.warn("Failed to set BLE TX power");
+    }
+    // Enable scanning on both 1M and coded PHY (long-range) when supported
+    if (BLE.setScanPhy(BlePhy::BLE_PHYS_CODED | BlePhy::BLE_PHYS_1MBPS) == SYSTEM_ERROR_NONE) {
+        Log.info("BLE scan PHY set to 1M + Coded (long range)");
+    } else {
+        Log.warn("Failed to set BLE scan PHY (device/OS may not support coded PHY)");
+    }
     
     // Set up scan parameters
     BLE.setScanTimeout(5); // 5 second scan timeout
@@ -455,10 +473,30 @@ void discoverSmartStallServices() {
     readAllCharacteristics();
     
     if (currentData.isValid) {
-        publishSmartStallData();
-        // Update registry lastRead and reset failureCount on success
+        // Decide whether to publish based on status change
         BleAddress addr = peer.address();
         int idx = findDeviceIndex(addr);
+        bool shouldPublish = true; // default: publish if no registry info
+        if (idx >= 0) {
+            DeviceInfo &d = knownDevices.at(idx);
+            if (d.hasLastStatus && d.lastStatusPublished == currentData.stallStatus) {
+                shouldPublish = false;
+                Log.info("Status unchanged (%u: %s) for %s; skipping publish",
+                    (unsigned)currentData.stallStatus,
+                    getStatusString(currentData.stallStatus),
+                    currentData.deviceAddress.c_str());
+            }
+        }
+
+        if (shouldPublish) {
+            publishSmartStallData();
+            if (idx >= 0) {
+                knownDevices.at(idx).hasLastStatus = true;
+                knownDevices.at(idx).lastStatusPublished = currentData.stallStatus;
+            }
+        }
+
+        // Update registry lastRead and reset failureCount on success
         if (idx >= 0) {
             knownDevices.at(idx).lastRead = millis();
             if (knownDevices.at(idx).failureCount > 0) knownDevices.at(idx).failureCount--;
@@ -558,6 +596,9 @@ void publishSmartStallData() {
         return;
     }
     
+    // Determine occupancy from status: 0,1,3,4 = non-occupied; 2,5 = occupied
+    bool isOccupied = (currentData.stallStatus == 2 || currentData.stallStatus == 5);
+
     // Create comprehensive JSON payload
     String jsonData = String::format(
         "{"
@@ -565,6 +606,7 @@ void publishSmartStallData() {
         "\"timestamp\":%lu,"
         "\"status\":%d,"
         "\"status_name\":\"%s\","
+        "\"occupied\":%s,"
         "\"battery_mv\":%d,"
         "\"battery_v\":%.2f,"
         "\"sensor_counts\":{"
@@ -577,6 +619,7 @@ void publishSmartStallData() {
         currentData.timestamp,
         currentData.stallStatus,
         getStatusString(currentData.stallStatus),
+        isOccupied ? "true" : "false",
         currentData.batteryVoltage,
         currentData.batteryVoltage / 1000.0f,
         currentData.sensorCounts.limit_switch_triggers,
