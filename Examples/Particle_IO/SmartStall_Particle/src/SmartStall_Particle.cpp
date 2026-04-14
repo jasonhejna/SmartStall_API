@@ -12,7 +12,7 @@
 // Include Particle Device OS APIs
 #include "Particle.h"
 
-PRODUCT_VERSION(1);
+PRODUCT_VERSION(2);
 
 // Let Device OS manage the connection to the Particle Cloud
 SYSTEM_MODE(AUTOMATIC);
@@ -38,6 +38,26 @@ bool hasPendingAddress = false;
 BleAddress pendingAddress; // valid only when hasPendingAddress == true
 unsigned long pendingAddressTimestamp = 0;
 const unsigned long PENDING_CONNECT_DEBOUNCE_MS = 50; // shorter debounce for faster connect
+
+// One BLE.connect per loop iteration — rapid back-to-back connects can assert/crash the Device OS BLE stack
+BleAddress connectTargetAddress;
+int connectAttemptIndex = 0; // 1..MAX_CONNECT_ATTEMPTS while in HUB_CONNECTING
+unsigned long nextConnectAttemptAt = 0;
+const int MAX_BLE_CONNECT_ATTEMPTS = 3;
+const unsigned long POST_STOP_SCAN_SETTLE_MS = 120;
+const unsigned long CONNECT_RETRY_GAP_MS = 800;
+// Minimum idle time after any link teardown before starting a new scan or connect (Particle BLE stack)
+const unsigned long BLE_STACK_COOLDOWN_MS = 2500;
+unsigned long bleQuietUntil = 0;
+// Set true only around peer.disconnect() after a successful poll — avoids counting that as a connect failure
+volatile bool expectingUserInitiatedDisconnect = false;
+
+static void armBleCooldown() {
+    unsigned long until = millis() + BLE_STACK_COOLDOWN_MS;
+    if (until > bleQuietUntil) {
+        bleQuietUntil = until;
+    }
+}
 
 // Device registry to track multiple known devices and poll them in a loop
 struct DeviceInfo {
@@ -151,7 +171,7 @@ int devicesScanned = 0;
 // Data structures matching SmartStall API
 struct SensorCounts {
     uint32_t limit_switch_triggers;
-    uint32_t ir_sensor_triggers;
+    uint32_t cap_touch_triggers; // was ir_sensor_triggers; matches peripheral / BLUETOOTH_API.md
     uint32_t hall_sensor_triggers;
 };
 
@@ -174,7 +194,7 @@ const char* getStatusString(uint16_t status) {
         case 2: return "LOCKED";              // Active locking sequence
         case 3: return "UNLOCKED";            // Active unlocking sequence
         case 4: return "SLEEP";               // Entering deep sleep mode
-        case 5: return "20_MINUTE_ALERT";     // Locked for 20+ minutes (safety alert)
+        case 5: return "PRE_SLEEP";           // 20-min idle; peripheral disconnecting before sleep (see BLUETOOTH_API.md)
         default: return "INVALID";
     }
 }
@@ -201,11 +221,12 @@ void setup() {
     } else {
         Log.warn("Failed to set BLE TX power");
     }
-    // Enable scanning on both 1M and coded PHY (long-range) when supported
-    if (BLE.setScanPhy(BlePhy::BLE_PHYS_CODED | BlePhy::BLE_PHYS_1MBPS) == SYSTEM_ERROR_NONE) {
-        Log.info("BLE scan PHY set to 1M + Coded (long range)");
+    // Use 1M PHY for scanning only. SmartStall peripheral may request LE Coded on link; the stack negotiates
+    // and falls back to 1M if needed — forcing coded scan has been associated with central instability on some builds.
+    if (BLE.setScanPhy(BlePhy::BLE_PHYS_1MBPS) == SYSTEM_ERROR_NONE) {
+        Log.info("BLE scan PHY set to 1M (compatible with SmartStall v1.2+)");
     } else {
-        Log.warn("Failed to set BLE scan PHY (device/OS may not support coded PHY)");
+        Log.warn("Failed to set BLE scan PHY to 1M");
     }
     
     // Set up scan parameters
@@ -221,7 +242,7 @@ void setup() {
     currentData.stallStatus = 0;
     currentData.batteryVoltage = 0;
     currentData.sensorCounts.limit_switch_triggers = 0;
-    currentData.sensorCounts.ir_sensor_triggers = 0;
+    currentData.sensorCounts.cap_touch_triggers = 0;
     currentData.sensorCounts.hall_sensor_triggers = 0;
     
     Log.info("Starting BLE scan for SmartStall devices...");
@@ -234,14 +255,15 @@ void loop() {
     unsigned long now = millis();
 
     // Periodic global scan to discover new devices while idle or even during polling cycle
-    if (now - lastGlobalScan >= GLOBAL_SCAN_INTERVAL_MS && currentState == HUB_SCANNING && !hasPendingAddress) {
+    if (now - lastGlobalScan >= GLOBAL_SCAN_INTERVAL_MS && currentState == HUB_SCANNING && !hasPendingAddress
+            && now >= bleQuietUntil) {
         Log.info("Periodic global scan starting (interval %lu ms)", GLOBAL_SCAN_INTERVAL_MS);
         BLE.scan(onScanResultReceived);
         lastGlobalScan = now;
     }
 
     // In base scanning/idle state select next device to poll if none pending
-    if (currentState == HUB_SCANNING && !hasPendingAddress) {
+    if (currentState == HUB_SCANNING && !hasPendingAddress && now >= bleQuietUntil) {
         int nextIdx = selectNextDeviceToPoll();
         if (nextIdx >= 0) {
             const DeviceInfo &d = knownDevices.at(nextIdx);
@@ -254,38 +276,25 @@ void loop() {
 
     switch(currentState) {
         case HUB_SCANNING:
-            if (millis() - lastScanTime > 15000) { // light opportunistic scan to refresh seen timestamps
+            // Avoid overlapping scan with pending connect or post-disconnect stack cooldown (assert risk)
+            if (!hasPendingAddress && millis() >= bleQuietUntil && millis() - lastScanTime > 15000) {
                 Log.info("Opportunistic scan tick (light refresh)");
                 BLE.scan(onScanResultReceived);
                 lastScanTime = millis();
             }
             // If we have a pending address from registry or scan callback, attempt connection after short debounce
-            if (hasPendingAddress && (millis() - pendingAddressTimestamp >= PENDING_CONNECT_DEBOUNCE_MS)) {
-                Log.info("Initiating deferred connection to %s", pendingAddress.toString().c_str());
+            if (hasPendingAddress && (millis() - pendingAddressTimestamp >= PENDING_CONNECT_DEBOUNCE_MS)
+                    && millis() >= bleQuietUntil) {
+                String pendingStr = pendingAddress.toString();
+                Log.info("Initiating deferred connection to %s", pendingStr.c_str());
                 hasPendingAddress = false; // consume it
+                expectingUserInitiatedDisconnect = false;
+                BLE.stopScanning();
+                connectTargetAddress = pendingAddress;
+                connectAttemptIndex = 0;
+                nextConnectAttemptAt = millis() + POST_STOP_SCAN_SETTLE_MS;
                 currentState = HUB_CONNECTING;
                 connectionStartTime = millis();
-                BLE.stopScanning();
-                const int MAX_CONNECT_ATTEMPTS = 3;
-                bool connected = false;
-                for (int attempt = 1; attempt <= MAX_CONNECT_ATTEMPTS; ++attempt) {
-                    Log.info("Connect attempt %d to %s", attempt, pendingAddress.toString().c_str());
-                    peer = BLE.connect(pendingAddress);
-                    if (peer.connected()) { connected = true; break; }
-                    delay(250);
-                }
-                if (!connected) {
-                    Log.error("All immediate connect attempts failed for %s", pendingAddress.toString().c_str());
-                    currentState = HUB_SCANNING;
-                    int idx = findDeviceIndex(pendingAddress);
-                    if (idx >= 0) {
-                        knownDevices.at(idx).failureCount = (uint8_t)min<int>(knownDevices.at(idx).failureCount + 1, 10);
-                        // push out next poll by pretending we just read (backoff handled by failureCount)
-                        knownDevices.at(idx).lastRead = millis();
-                    }
-                } else {
-                    connectedDeviceAddress = pendingAddress.toString();
-                }
             }
             break;
             
@@ -295,13 +304,52 @@ void loop() {
                 Log.warn("Connected detected without callback; proceeding to discovery");
                 onConnected(peer);
             }
-            if (millis() - connectionStartTime > 10000) { // shorter 10 second timeout
-                Log.warn("Connection timeout (10s), marking failure and returning to scan");
-                int idx = findDeviceIndex(pendingAddress); // may not be valid now, fallback to connectedDeviceAddress
-                if (idx < 0 && connectedDeviceAddress.length()) {
-                    // attempt to parse connectedDeviceAddress back? leave as is.
+            if (currentState != HUB_CONNECTING) {
+                break;
+            }
+            // Total window for settle + staggered retries (do not hammer BLE.connect in one loop tick)
+            if (millis() - connectionStartTime > 20000) {
+                Log.warn("Connection timeout (20s), marking failure and returning to scan");
+                int idx = findDeviceIndex(connectTargetAddress);
+                if (idx >= 0) {
+                    knownDevices.at(idx).failureCount = (uint8_t)min<int>(knownDevices.at(idx).failureCount + 1, 10);
+                    knownDevices.at(idx).lastRead = millis();
                 }
                 resetConnection();
+                break;
+            }
+            if (millis() < nextConnectAttemptAt) {
+                break;
+            }
+            if (connectAttemptIndex >= MAX_BLE_CONNECT_ATTEMPTS) {
+                String failStr = connectTargetAddress.toString();
+                Log.error("All connect attempts failed for %s", failStr.c_str());
+                int idx = findDeviceIndex(connectTargetAddress);
+                if (idx >= 0) {
+                    knownDevices.at(idx).failureCount = (uint8_t)min<int>(knownDevices.at(idx).failureCount + 1, 10);
+                    knownDevices.at(idx).lastRead = millis();
+                }
+                resetConnection();
+                break;
+            }
+            connectAttemptIndex++;
+            {
+                String tgtStr = connectTargetAddress.toString();
+                Log.info("Connect attempt %d/%d to %s", connectAttemptIndex, MAX_BLE_CONNECT_ATTEMPTS, tgtStr.c_str());
+            }
+            peer = BLE.connect(connectTargetAddress);
+            // onDisconnected can run during connect and clear HUB_CONNECTING — do not assert stack further
+            if (currentState != HUB_CONNECTING) {
+                String tgtStr = connectTargetAddress.toString();
+                Log.warn("Connect superseded by disconnect for %s; backing off", tgtStr.c_str());
+                armBleCooldown();
+                break;
+            }
+            if (peer.connected()) {
+                connectedDeviceAddress = connectTargetAddress.toString();
+                onConnected(peer);
+            } else {
+                nextConnectAttemptAt = millis() + CONNECT_RETRY_GAP_MS;
             }
             break; }
             
@@ -388,7 +436,8 @@ void onScanResultReceived(const BleScanResult &scanResult) {
 
 // Callback when connected to a BLE device
 void onConnected(const BlePeerDevice &connectedPeer) {
-    Log.info("Connected to SmartStall device: %s", connectedPeer.address().toString().c_str());
+    String connAddr = connectedPeer.address().toString();
+    Log.info("Connected to SmartStall device: %s", connAddr.c_str());
     
     // Store the peer for later use
     peer = connectedPeer;
@@ -403,13 +452,31 @@ void onConnected(const BlePeerDevice &connectedPeer) {
     currentData.stallStatus = 0;
     currentData.batteryVoltage = 0;
     currentData.sensorCounts.limit_switch_triggers = 0;
-    currentData.sensorCounts.ir_sensor_triggers = 0;
+    currentData.sensorCounts.cap_touch_triggers = 0;
     currentData.sensorCounts.hall_sensor_triggers = 0;
 }
 
 // Callback when disconnected from a BLE device
-void onDisconnected(const BlePeerDevice &peer) {
-    Log.info("Disconnected from SmartStall device: %s", peer.address().toString().c_str());
+void onDisconnected(const BlePeerDevice &disconnectedPeer) {
+    String discAddr = disconnectedPeer.address().toString();
+    Log.info("Disconnected from SmartStall device: %s", discAddr.c_str());
+
+    if (expectingUserInitiatedDisconnect) {
+        expectingUserInitiatedDisconnect = false;
+    } else {
+        // Abrupt teardown: apply registry backoff so we don't BLE.connect again in ~100 ms (stack assert)
+        HubState st = currentState;
+        int idx = findDeviceIndex(disconnectedPeer.address());
+        if (idx < 0) {
+            idx = findDeviceIndex(connectTargetAddress);
+        }
+        if (idx >= 0 && (st == HUB_CONNECTING || st == HUB_DISCOVERING)) {
+            knownDevices.at(idx).failureCount = (uint8_t)min<int>(knownDevices.at(idx).failureCount + 1, 10);
+            knownDevices.at(idx).lastRead = millis();
+            Log.warn("Unexpected disconnect in state %d; registry backoff for %s", (int)st, discAddr.c_str());
+        }
+        armBleCooldown();
+    }
     currentState = HUB_DISCONNECTED;
 }
 
@@ -513,6 +580,7 @@ void discoverSmartStallServices() {
     // Disconnect now to allow cycling among devices quickly
     if (peer.connected()) {
         Log.info("Disconnecting after poll cycle");
+        expectingUserInitiatedDisconnect = true;
         peer.disconnect();
     }
     currentState = HUB_DISCONNECTED; // Trigger reset/scan in loop
@@ -556,13 +624,13 @@ void readAllCharacteristics() {
                 Log.info("Sensor counts read (%d bytes)", (int)count);
                 currentData.sensorCounts.limit_switch_triggers = 
                     sensorData[0] | (sensorData[1] << 8) | (sensorData[2] << 16) | (sensorData[3] << 24);
-                currentData.sensorCounts.ir_sensor_triggers = 
+                currentData.sensorCounts.cap_touch_triggers = 
                     sensorData[4] | (sensorData[5] << 8) | (sensorData[6] << 16) | (sensorData[7] << 24);
                 currentData.sensorCounts.hall_sensor_triggers = 
                     sensorData[8] | (sensorData[9] << 8) | (sensorData[10] << 16) | (sensorData[11] << 24);
-                Log.info("Counts - Limit:%lu IR:%lu Hall:%lu", 
+                Log.info("Counts - Limit:%lu CapTouch:%lu Hall:%lu", 
                     currentData.sensorCounts.limit_switch_triggers,
-                    currentData.sensorCounts.ir_sensor_triggers,
+                    currentData.sensorCounts.cap_touch_triggers,
                     currentData.sensorCounts.hall_sensor_triggers);
                 return true; }
             Log.warn("Sensor counts read attempt %d failed (bytes=%d)", attempt + 1, (int)count);
@@ -586,7 +654,7 @@ void readAllCharacteristics() {
     }
     
     currentData.timestamp = Time.now();
-    currentData.isValid = true;
+    currentData.isValid = (okStatus && okBattery && okCounts);
 }
 
 // Publish complete SmartStall data to Particle cloud
@@ -611,7 +679,7 @@ void publishSmartStallData() {
         "\"battery_v\":%.2f,"
         "\"sensor_counts\":{"
             "\"limit_switch\":%lu,"
-            "\"ir_sensor\":%lu,"
+            "\"cap_touch\":%lu,"
             "\"hall_sensor\":%lu"
         "}"
         "}",
@@ -623,7 +691,7 @@ void publishSmartStallData() {
         currentData.batteryVoltage,
         currentData.batteryVoltage / 1000.0f,
         currentData.sensorCounts.limit_switch_triggers,
-        currentData.sensorCounts.ir_sensor_triggers,
+        currentData.sensorCounts.cap_touch_triggers,
         currentData.sensorCounts.hall_sensor_triggers
     );
     
@@ -636,6 +704,7 @@ void publishSmartStallData() {
 // Reset connection and return to scanning
 void resetConnection() {
     if (peer.connected()) {
+        expectingUserInitiatedDisconnect = true;
         peer.disconnect();
     }
     
@@ -643,6 +712,7 @@ void resetConnection() {
     lastScanTime = millis() - 9000; // Start scanning soon
     connectedDeviceAddress = "";
     currentData.isValid = false;
+    armBleCooldown();
     
     Log.info("Connection reset, returning to scan mode");
 }
