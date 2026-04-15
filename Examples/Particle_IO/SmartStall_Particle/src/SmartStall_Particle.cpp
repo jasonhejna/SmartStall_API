@@ -12,7 +12,7 @@
 // Include Particle Device OS APIs
 #include "Particle.h"
 
-PRODUCT_VERSION(2);
+PRODUCT_VERSION(4);
 
 // Let Device OS manage the connection to the Particle Cloud
 SYSTEM_MODE(AUTOMATIC);
@@ -20,6 +20,22 @@ SYSTEM_MODE(AUTOMATIC);
 // Show system, cloud connectivity, and application logs over USB
 SerialLogHandler logHandler(LOG_LEVEL_INFO);
 // Note: SYSTEM_THREAD() is enabled by default on Device OS >= 6.2.0 (warning avoided by not calling macro)
+
+// Particle Ledger (Device -> Cloud)
+// Requires Device OS 6.1.0+ and device must be in a Product.
+// Docs: https://docs.particle.io/getting-started/logic-ledger/ledger/
+// Example: https://docs.particle.io/getting-started/logic-ledger/ledger-sensor/
+Ledger deviceToCloudLedger;
+bool ledgersInitialized = false;
+
+// Single Device -> Cloud ledger name (must exist in your Product)
+const char *DEVICE_TO_CLOUD_LEDGER_NAME = "device-to-cloud";
+
+unsigned long lastUnifiedLedgerWriteMs = 0;
+unsigned long lastHubLedgerWriteMs = 0;
+const unsigned long HUB_LEDGER_PERIOD_MS = 60000;        // 1 minute
+const unsigned long LEDGER_MIN_GAP_MS = 5000;            // 5 seconds (rate-limit all writes)
+volatile bool devicesLedgerDirty = true;                 // set when registry/read state changes
 
 // SmartStall BLE Service and Characteristic UUIDs
 const BleUuid SMARTSTALL_SERVICE_UUID("c56a1b98-6c1e-413a-b138-0e9f320c7e8b");
@@ -59,6 +75,23 @@ static void armBleCooldown() {
     }
 }
 
+// Hub health metrics (persisted to ledger)
+struct HubMetrics {
+    uint32_t scansStarted = 0;
+    uint32_t scanResultsSeen = 0;
+    uint32_t smartstallSeen = 0;
+    uint32_t connectsAttempted = 0;
+    uint32_t connectsSucceeded = 0;
+    uint32_t unexpectedDisconnects = 0;
+    uint32_t pollCyclesSucceeded = 0; // full readAllCharacteristics succeeded
+    uint32_t pollCyclesFailed = 0;
+    uint32_t profileRejected = 0; // pre-v1.2 NOTIFY profile or invalid GATT (skipped reads)
+    uint32_t ledgerWritesHub = 0;
+    uint32_t ledgerWritesDevices = 0;
+};
+
+HubMetrics hubMetrics;
+
 // Device registry to track multiple known devices and poll them in a loop
 struct DeviceInfo {
     BleAddress address;
@@ -67,6 +100,9 @@ struct DeviceInfo {
     uint8_t failureCount;     // consecutive failures
     bool hasLastStatus;       // whether we have published a status before
     uint16_t lastStatusPublished; // last status value we published
+    // Older SmartStall firmware (pre-v1.2) may advertise NOTIFY; hub is read-only — skip to avoid stack asserts
+    bool legacyProfileBlocked = false;
+    unsigned long legacyProfileRetryAfterMs = 0;
 };
 
 Vector<DeviceInfo> knownDevices;
@@ -79,8 +115,13 @@ const unsigned long DEVICE_FAILURE_BACKOFF_MS    = 45000;  // additional backoff
 const uint8_t       MAX_FAILURES_BEFORE_BACKOFF  = 3;
 const int           MAX_TRACKED_DEVICES          = 12;     // limit to prevent memory overuse
 const unsigned long DEVICE_STALE_MS              = 120000; // if not seen in 2 minutes, skip polling
+const unsigned long LEGACY_PROFILE_RETRY_MS      = 86400000UL; // 24h — re-probe after peripheral FW upgrade
 
 unsigned long lastGlobalScan = 0; // timestamp of last broad scan
+
+// Ledger helpers are implemented later, after `currentState` and `currentData` exist.
+static void maybeInitLedgers();
+static void writeUnifiedLedger(bool force);
 
 int findDeviceIndex(const BleAddress &addr) {
     int total = knownDevices.size();
@@ -92,11 +133,48 @@ int findDeviceIndex(const BleAddress &addr) {
     return -1;
 }
 
+static inline bool blePropHas(uint32_t propBits, BleCharacteristicProperty bit) {
+    return (propBits & (uint32_t)bit) != 0;
+}
+
+// Hub targets SmartStall v1.2+ (READ-only GATT, no NOTIFY/CCCD). See BLUETOOTH_API.md.
+static const char *validateV12ReadOnlyProfile() {
+    if (!stallStatusChar.isValid() || !batteryVoltageChar.isValid() || !sensorCountsChar.isValid()) {
+        return "missing required characteristics (status/battery/sensor_counts)";
+    }
+    const BleCharacteristic *chars[] = { &stallStatusChar, &batteryVoltageChar, &sensorCountsChar };
+    for (const BleCharacteristic *ch : chars) {
+        uint32_t pr = (uint32_t)ch->properties();
+        if (blePropHas(pr, BleCharacteristicProperty::NOTIFY)) {
+            return "NOTIFY present (pre-v1.2 profile); hub does not subscribe";
+        }
+        if (blePropHas(pr, BleCharacteristicProperty::INDICATE)) {
+            return "INDICATE present (pre-v1.2 profile); hub does not subscribe";
+        }
+        // Do not require BleCharacteristicProperty::READ here: on some platforms (e.g. MSoM)
+        // discovery omits the READ bit even when getValue() works. We only reject NOTIFY/INDICATE.
+    }
+    return nullptr;
+}
+
+static void markLegacyProfileRejected(const BleAddress &addr) {
+    int idx = findDeviceIndex(addr);
+    if (idx < 0) return;
+    DeviceInfo &d = knownDevices.at(idx);
+    d.legacyProfileBlocked = true;
+    d.legacyProfileRetryAfterMs = millis() + LEGACY_PROFILE_RETRY_MS;
+    d.lastRead = millis();
+    d.failureCount = (uint8_t)min<int>(d.failureCount + 1, 10);
+    devicesLedgerDirty = true;
+    armBleCooldown();
+}
+
 void registerOrUpdateDevice(const BleAddress &addr) {
     int idx = findDeviceIndex(addr);
     if (idx >= 0) {
         DeviceInfo &d = knownDevices.at(idx);
         d.lastSeen = millis();
+        devicesLedgerDirty = true;
         // If we previously had many failures and now see it again, we can gently decay failures
         if (d.failureCount > 0 && (millis() - d.lastRead) > (DEVICE_POLL_INTERVAL_MS * 2)) {
             d.failureCount--;
@@ -114,6 +192,7 @@ void registerOrUpdateDevice(const BleAddress &addr) {
         d.hasLastStatus = false;
         d.lastStatusPublished = 0;
         knownDevices.append(d);
+        devicesLedgerDirty = true;
         Log.info("Added new SmartStall device to registry (%d total): %s", knownDevices.size(), addr.toString().c_str());
     }
 }
@@ -132,6 +211,21 @@ int selectNextDeviceToPoll() {
             idx = (idx + 1) % total;
             attempts++;
             continue;
+        }
+        // Pre-v1.2 NOTIFY profile: skip polling until retry window (then reprobe once)
+        if (d.legacyProfileBlocked) {
+            if (now >= d.legacyProfileRetryAfterMs) {
+                d.legacyProfileBlocked = false;
+                devicesLedgerDirty = true;
+                {
+                    String addrStr = d.address.toString();
+                    Log.info("Legacy profile retry window reached; will reprobe %s", addrStr.c_str());
+                }
+            } else {
+                idx = (idx + 1) % total;
+                attempts++;
+                continue;
+            }
         }
         unsigned long sinceLastRead = (d.lastRead == 0) ? (unsigned long)0 : (now - d.lastRead);
         unsigned long neededInterval = DEVICE_POLL_INTERVAL_MS;
@@ -185,6 +279,107 @@ struct SmartStallData {
 };
 
 SmartStallData currentData;
+
+// ---- Ledger helper implementations (must be after currentState/currentData declarations) ----
+static void maybeInitLedgers() {
+    if (ledgersInitialized) return;
+    if (!Particle.connected()) return;
+    // Device -> Cloud ledgers must already exist in the Product.
+    deviceToCloudLedger = Particle.ledger(DEVICE_TO_CLOUD_LEDGER_NAME);
+    ledgersInitialized = true;
+    devicesLedgerDirty = true;
+    Log.info("Ledger initialized: %s", DEVICE_TO_CLOUD_LEDGER_NAME);
+}
+
+static void writeUnifiedLedger(bool force) {
+    if (!ledgersInitialized) return;
+    unsigned long now = millis();
+    bool hubDue = ((now - lastHubLedgerWriteMs) >= HUB_LEDGER_PERIOD_MS);
+    bool okGap = ((now - lastUnifiedLedgerWriteMs) >= LEDGER_MIN_GAP_MS);
+    if (!force && !hubDue && !devicesLedgerDirty) return;
+    if (!force && !okGap) return;
+
+    Variant root;
+    root.set("ts_ms", (int64_t)now);
+    if (Time.isValid()) {
+        root.set("time", Time.format(TIME_FORMAT_ISO8601_FULL));
+    }
+
+    // Hub section
+    Variant hub;
+    hub.set("state", (int)currentState);
+    Variant ble;
+    ble.set("cooldown_ms", (int64_t)((now >= bleQuietUntil) ? 0 : (bleQuietUntil - now)));
+    ble.set("connected", peer.connected());
+    hub.set("ble", ble);
+
+    Variant metrics;
+    metrics.set("scans_started", (int64_t)hubMetrics.scansStarted);
+    metrics.set("scan_results_seen", (int64_t)hubMetrics.scanResultsSeen);
+    metrics.set("smartstall_seen", (int64_t)hubMetrics.smartstallSeen);
+    metrics.set("connects_attempted", (int64_t)hubMetrics.connectsAttempted);
+    metrics.set("connects_succeeded", (int64_t)hubMetrics.connectsSucceeded);
+    metrics.set("unexpected_disconnects", (int64_t)hubMetrics.unexpectedDisconnects);
+    metrics.set("poll_ok", (int64_t)hubMetrics.pollCyclesSucceeded);
+    metrics.set("poll_fail", (int64_t)hubMetrics.pollCyclesFailed);
+    metrics.set("profile_reject", (int64_t)hubMetrics.profileRejected);
+    metrics.set("ledger_hub_writes", (int64_t)hubMetrics.ledgerWritesHub);
+    metrics.set("ledger_devices_writes", (int64_t)hubMetrics.ledgerWritesDevices);
+    hub.set("metrics", metrics);
+
+    Variant registry;
+    registry.set("tracked_devices", (int)knownDevices.size());
+    hub.set("registry", registry);
+    root.set("hub", hub);
+
+    // Devices section
+    Variant devicesObj;
+    int total = knownDevices.size();
+    for (int i = 0; i < total; ++i) {
+        const DeviceInfo &d = knownDevices.at(i);
+        String key = d.address.toString();
+        Variant dv;
+        dv.set("last_seen_ms", (int64_t)d.lastSeen);
+        dv.set("last_read_ms", (int64_t)d.lastRead);
+        dv.set("failures", (int)d.failureCount);
+        if (d.hasLastStatus) {
+            dv.set("last_status", (int)d.lastStatusPublished);
+        }
+        dv.set("legacy_blocked", d.legacyProfileBlocked);
+        dv.set("legacy_retry_after_ms", (int64_t)d.legacyProfileRetryAfterMs);
+        devicesObj.set(key.c_str(), dv);
+    }
+    Variant devicesSection;
+    devicesSection.set("registry", devicesObj);
+
+    // Also include last successful read payload (if any) for quick inspection
+    if (currentData.isValid) {
+        Variant last;
+        last.set("device", currentData.deviceAddress);
+        last.set("status", (int)currentData.stallStatus);
+        last.set("battery_mv", (int)currentData.batteryVoltage);
+        Variant counts;
+        counts.set("limit_switch", (int64_t)currentData.sensorCounts.limit_switch_triggers);
+        counts.set("cap_touch", (int64_t)currentData.sensorCounts.cap_touch_triggers);
+        counts.set("hall_sensor", (int64_t)currentData.sensorCounts.hall_sensor_triggers);
+        last.set("sensor_counts", counts);
+        last.set("read_ts", (int64_t)currentData.timestamp);
+        devicesSection.set("last_read", last);
+    }
+
+    root.set("devices", devicesSection);
+
+    deviceToCloudLedger.set(root);
+    lastUnifiedLedgerWriteMs = now;
+    if (hubDue || force) {
+        hubMetrics.ledgerWritesHub++;
+        lastHubLedgerWriteMs = now;
+    }
+    if (devicesLedgerDirty || force) {
+        hubMetrics.ledgerWritesDevices++;
+        devicesLedgerDirty = false;
+    }
+}
 
 // Status value definitions
 const char* getStatusString(uint16_t status) {
@@ -254,11 +449,15 @@ void setup() {
 void loop() {
     unsigned long now = millis();
 
+    maybeInitLedgers();
+    writeUnifiedLedger(false);
+
     // Periodic global scan to discover new devices while idle or even during polling cycle
     if (now - lastGlobalScan >= GLOBAL_SCAN_INTERVAL_MS && currentState == HUB_SCANNING && !hasPendingAddress
             && now >= bleQuietUntil) {
         Log.info("Periodic global scan starting (interval %lu ms)", GLOBAL_SCAN_INTERVAL_MS);
         BLE.scan(onScanResultReceived);
+        hubMetrics.scansStarted++;
         lastGlobalScan = now;
     }
 
@@ -280,6 +479,7 @@ void loop() {
             if (!hasPendingAddress && millis() >= bleQuietUntil && millis() - lastScanTime > 15000) {
                 Log.info("Opportunistic scan tick (light refresh)");
                 BLE.scan(onScanResultReceived);
+                hubMetrics.scansStarted++;
                 lastScanTime = millis();
             }
             // If we have a pending address from registry or scan callback, attempt connection after short debounce
@@ -337,6 +537,7 @@ void loop() {
                 String tgtStr = connectTargetAddress.toString();
                 Log.info("Connect attempt %d/%d to %s", connectAttemptIndex, MAX_BLE_CONNECT_ATTEMPTS, tgtStr.c_str());
             }
+            hubMetrics.connectsAttempted++;
             peer = BLE.connect(connectTargetAddress);
             // onDisconnected can run during connect and clear HUB_CONNECTING — do not assert stack further
             if (currentState != HUB_CONNECTING) {
@@ -347,6 +548,7 @@ void loop() {
             }
             if (peer.connected()) {
                 connectedDeviceAddress = connectTargetAddress.toString();
+                hubMetrics.connectsSucceeded++;
                 onConnected(peer);
             } else {
                 nextConnectAttemptAt = millis() + CONNECT_RETRY_GAP_MS;
@@ -381,6 +583,7 @@ void loop() {
 // Callback when a BLE device is found during scanning
 void onScanResultReceived(const BleScanResult &scanResult) {
     String deviceName = scanResult.advertisingData().deviceName();
+    hubMetrics.scanResultsSeen++;
     
     Log.info("Found device - Name: '%s', Address: %s, RSSI: %d", 
              deviceName.c_str(), 
@@ -420,14 +623,20 @@ void onScanResultReceived(const BleScanResult &scanResult) {
     }
     
     if (isSmartStall) {
+        hubMetrics.smartstallSeen++;
         // Register or update device in registry
         registerOrUpdateDevice(scanResult.address());
         // If we currently have no devices pending and none connected, schedule this immediately
-        if (!hasPendingAddress && currentState == HUB_SCANNING) {
+        int regIdx = findDeviceIndex(scanResult.address());
+        bool legacyCooling = (regIdx >= 0 && knownDevices.at(regIdx).legacyProfileBlocked
+            && millis() < knownDevices.at(regIdx).legacyProfileRetryAfterMs);
+        if (!hasPendingAddress && currentState == HUB_SCANNING && !legacyCooling) {
             Log.info("Queuing newly discovered SmartStall device for polling: %s", scanResult.address().toString().c_str());
             pendingAddress = scanResult.address();
             hasPendingAddress = true;
             pendingAddressTimestamp = millis();
+        } else if (legacyCooling) {
+            Log.info("SmartStall %s in legacy-profile cooldown; not auto-queuing", scanResult.address().toString().c_str());
         } else {
             Log.info("Device %s registered; will be polled in rotation", scanResult.address().toString().c_str());
         }
@@ -466,6 +675,7 @@ void onDisconnected(const BlePeerDevice &disconnectedPeer) {
     } else {
         // Abrupt teardown: apply registry backoff so we don't BLE.connect again in ~100 ms (stack assert)
         HubState st = currentState;
+        hubMetrics.unexpectedDisconnects++;
         int idx = findDeviceIndex(disconnectedPeer.address());
         if (idx < 0) {
             idx = findDeviceIndex(connectTargetAddress);
@@ -525,55 +735,105 @@ void discoverSmartStallServices() {
         }
     }
     if (!serviceFound) {
-        Log.warn("SmartStall service UUID not found in discovered services; attempting direct characteristic lookups");
-        // Fallback: attempt to resolve characteristics by UUID directly (if API supports; else rely on read attempts)
+        Log.warn("SmartStall service UUID not found in discovered services");
     }
-    
+
     // Verify what we found
     Log.info("Discovery summary:");
     Log.info("- Stall Status Char Valid: %s", stallStatusChar.isValid() ? "YES" : "NO");
     Log.info("- Battery Voltage Char Valid: %s", batteryVoltageChar.isValid() ? "YES" : "NO");
     Log.info("- Sensor Counts Char Valid: %s", sensorCountsChar.isValid() ? "YES" : "NO");
-    
-    // Single-shot read: immediately read characteristics without subscribing to notifications
-    Log.info("Performing single-shot characteristic reads (with retries)...");
-    readAllCharacteristics();
-    
-    if (currentData.isValid) {
-        // Decide whether to publish based on status change
+
+    const char *profileRejectReason = nullptr;
+    bool didRead = false;
+
+    if (!serviceFound) {
+        profileRejectReason = "smartstall service uuid not found";
+    } else {
+        profileRejectReason = validateV12ReadOnlyProfile();
+        if (profileRejectReason) {
+            Log.warn("SmartStall GATT rejected (hub: no NOTIFY/INDICATE on status/battery/counts): %s", profileRejectReason);
+        }
+    }
+
+    if (!serviceFound || profileRejectReason) {
+        hubMetrics.pollCyclesFailed++;
+        currentData.isValid = false;
         BleAddress addr = peer.address();
         int idx = findDeviceIndex(addr);
-        bool shouldPublish = true; // default: publish if no registry info
-        if (idx >= 0) {
-            DeviceInfo &d = knownDevices.at(idx);
-            if (d.hasLastStatus && d.lastStatusPublished == currentData.stallStatus) {
-                shouldPublish = false;
-                Log.info("Status unchanged (%u: %s) for %s; skipping publish",
-                    (unsigned)currentData.stallStatus,
-                    getStatusString(currentData.stallStatus),
-                    currentData.deviceAddress.c_str());
+        if (profileRejectReason && serviceFound) {
+            String rs(profileRejectReason);
+            if (rs.indexOf("NOTIFY") >= 0 || rs.indexOf("INDICATE") >= 0) {
+                hubMetrics.profileRejected++;
+                markLegacyProfileRejected(addr);
+            } else {
+                if (idx >= 0) {
+                    knownDevices.at(idx).failureCount = (uint8_t)min<int>(knownDevices.at(idx).failureCount + 1, 10);
+                    knownDevices.at(idx).lastRead = millis();
+                }
             }
-        }
-
-        if (shouldPublish) {
-            publishSmartStallData();
+        } else {
             if (idx >= 0) {
-                knownDevices.at(idx).hasLastStatus = true;
-                knownDevices.at(idx).lastStatusPublished = currentData.stallStatus;
+                knownDevices.at(idx).failureCount = (uint8_t)min<int>(knownDevices.at(idx).failureCount + 1, 10);
+                knownDevices.at(idx).lastRead = millis();
             }
-        }
-
-        // Update registry lastRead and reset failureCount on success
-        if (idx >= 0) {
-            knownDevices.at(idx).lastRead = millis();
-            if (knownDevices.at(idx).failureCount > 0) knownDevices.at(idx).failureCount--;
         }
     } else {
-        Log.warn("Data invalid after read; marking failure");
         BleAddress addr = peer.address();
-        int idx = findDeviceIndex(addr);
-        if (idx >= 0) {
-            knownDevices.at(idx).failureCount = (uint8_t)min<int>(knownDevices.at(idx).failureCount + 1, 10);
+        int idxProbe = findDeviceIndex(addr);
+        if (idxProbe >= 0 && knownDevices.at(idxProbe).legacyProfileBlocked) {
+            knownDevices.at(idxProbe).legacyProfileBlocked = false;
+            knownDevices.at(idxProbe).legacyProfileRetryAfterMs = 0;
+            devicesLedgerDirty = true;
+            Log.info("GATT probe passed; cleared legacy-profile block for %s", currentData.deviceAddress.c_str());
+        }
+        Log.info("GATT profile OK; performing single-shot characteristic reads (with retries)...");
+        readAllCharacteristics();
+        didRead = true;
+    }
+
+    if (didRead) {
+        if (currentData.isValid) {
+            hubMetrics.pollCyclesSucceeded++;
+            // Decide whether to publish based on status change
+            BleAddress addr = peer.address();
+            int idx = findDeviceIndex(addr);
+            bool shouldPublish = true; // default: publish if no registry info
+            if (idx >= 0) {
+                DeviceInfo &d = knownDevices.at(idx);
+                if (d.hasLastStatus && d.lastStatusPublished == currentData.stallStatus) {
+                    shouldPublish = false;
+                    Log.info("Status unchanged (%u: %s) for %s; skipping publish",
+                        (unsigned)currentData.stallStatus,
+                        getStatusString(currentData.stallStatus),
+                        currentData.deviceAddress.c_str());
+                }
+            }
+
+            if (shouldPublish) {
+                publishSmartStallData();
+                if (idx >= 0) {
+                    knownDevices.at(idx).hasLastStatus = true;
+                    knownDevices.at(idx).lastStatusPublished = currentData.stallStatus;
+                }
+            }
+
+            // Update registry lastRead and reset failureCount on success
+            if (idx >= 0) {
+                knownDevices.at(idx).lastRead = millis();
+                if (knownDevices.at(idx).failureCount > 0) knownDevices.at(idx).failureCount--;
+                knownDevices.at(idx).legacyProfileBlocked = false;
+                knownDevices.at(idx).legacyProfileRetryAfterMs = 0;
+                devicesLedgerDirty = true;
+            }
+        } else {
+            hubMetrics.pollCyclesFailed++;
+            Log.warn("Data invalid after read; marking failure");
+            BleAddress addr = peer.address();
+            int idx = findDeviceIndex(addr);
+            if (idx >= 0) {
+                knownDevices.at(idx).failureCount = (uint8_t)min<int>(knownDevices.at(idx).failureCount + 1, 10);
+            }
         }
     }
     
@@ -585,6 +845,11 @@ void discoverSmartStallServices() {
     }
     currentState = HUB_DISCONNECTED; // Trigger reset/scan in loop
     Log.info("Poll cycle complete; device queued for next interval");
+
+    // Ledger snapshot on poll completion (rate-limited). Force write on success.
+    if (ledgersInitialized) {
+        writeUnifiedLedger(currentData.isValid);
+    }
 }
 
 // Read all characteristics manually (for periodic data collection)
