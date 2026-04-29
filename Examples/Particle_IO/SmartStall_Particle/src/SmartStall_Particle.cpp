@@ -12,10 +12,43 @@
 // Include Particle Device OS APIs
 #include "Particle.h"
 
-PRODUCT_VERSION(4);
+PRODUCT_VERSION(5);
 
 // Let Device OS manage the connection to the Particle Cloud
 SYSTEM_MODE(AUTOMATIC);
+
+// Power/charging configuration (Muon / M-SoM)
+// Particle recommends using Power Manager (System.setPowerConfiguration) instead of directly setting PMIC,
+// otherwise Device OS may override your PMIC changes.
+// Docs:
+// - https://docs.particle.io/reference/device-os/api/power-manager/power-manager/
+// - https://docs.particle.io/reference/device-os/api/pmic-power-management-ic/pmic-power-management-ic/
+//
+// NOTE: Power settings are persistent (stored in config flash). You generally only need to set them once.
+// If you want to stop overriding power settings on every boot, set this to 0 after your dev board is configured.
+#ifndef SMARTSTALL_CONFIGURE_POWER
+#define SMARTSTALL_CONFIGURE_POWER 1
+#endif
+
+#if SMARTSTALL_CONFIGURE_POWER
+STARTUP([] {
+    SystemPowerConfiguration conf;
+    conf.powerSourceMinVoltage(3880)      // mV
+        .powerSourceMaxCurrent(1500)     // mA (VIN; can be used with USB host if feature enabled)
+        .batteryChargeCurrent(900)       // mA (actual is min(powerSourceMaxCurrent, batteryChargeCurrent))
+        .batteryChargeVoltage(4210);     // mV termination voltage
+
+    // If you're plugged into a computer for debugging but powering from VIN,
+    // this makes VIN settings apply even when a USB host is detected.
+    conf.feature(SystemPowerFeature::USE_VIN_SETTINGS_WITH_USB_HOST);
+
+    // Ensure charging isn't disabled by a previously persisted configuration.
+    // Device OS uses clearFeature(), not feature(..., false) — see spark_wiring_system_power.h
+    conf.clearFeature(SystemPowerFeature::DISABLE_CHARGING);
+
+    System.setPowerConfiguration(conf);
+});
+#endif
 
 // Show system, cloud connectivity, and application logs over USB
 SerialLogHandler logHandler(LOG_LEVEL_INFO);
@@ -100,6 +133,10 @@ struct DeviceInfo {
     uint8_t failureCount;     // consecutive failures
     bool hasLastStatus;       // whether we have published a status before
     uint16_t lastStatusPublished; // last status value we published
+    bool hasLastCounts = false; // whether we have published counts before
+    uint32_t lastLimitSwitchPublished = 0;
+    uint32_t lastCapTouchPublished = 0;
+    uint32_t lastHallPublished = 0;
     // Older SmartStall firmware (pre-v1.2) may advertise NOTIFY; hub is read-only — skip to avoid stack asserts
     bool legacyProfileBlocked = false;
     unsigned long legacyProfileRetryAfterMs = 0;
@@ -191,6 +228,10 @@ void registerOrUpdateDevice(const BleAddress &addr) {
         d.failureCount = 0;
         d.hasLastStatus = false;
         d.lastStatusPublished = 0;
+        d.hasLastCounts = false;
+        d.lastLimitSwitchPublished = 0;
+        d.lastCapTouchPublished = 0;
+        d.lastHallPublished = 0;
         knownDevices.append(d);
         devicesLedgerDirty = true;
         Log.info("Added new SmartStall device to registry (%d total): %s", knownDevices.size(), addr.toString().c_str());
@@ -795,18 +836,26 @@ void discoverSmartStallServices() {
     if (didRead) {
         if (currentData.isValid) {
             hubMetrics.pollCyclesSucceeded++;
-            // Decide whether to publish based on status change
+            // Decide whether to publish based on status OR counts change
             BleAddress addr = peer.address();
             int idx = findDeviceIndex(addr);
             bool shouldPublish = true; // default: publish if no registry info
             if (idx >= 0) {
                 DeviceInfo &d = knownDevices.at(idx);
-                if (d.hasLastStatus && d.lastStatusPublished == currentData.stallStatus) {
+                bool statusChanged = (!d.hasLastStatus || d.lastStatusPublished != currentData.stallStatus);
+                bool countsChanged = (!d.hasLastCounts
+                    || d.lastLimitSwitchPublished != currentData.sensorCounts.limit_switch_triggers
+                    || d.lastCapTouchPublished != currentData.sensorCounts.cap_touch_triggers
+                    || d.lastHallPublished != currentData.sensorCounts.hall_sensor_triggers);
+                if (!statusChanged && !countsChanged) {
                     shouldPublish = false;
-                    Log.info("Status unchanged (%u: %s) for %s; skipping publish",
-                        (unsigned)currentData.stallStatus,
-                        getStatusString(currentData.stallStatus),
+                    Log.info("Status and counts unchanged for %s; skipping publish",
                         currentData.deviceAddress.c_str());
+                } else {
+                    Log.info("Change detected for %s (status_changed=%d counts_changed=%d)",
+                        currentData.deviceAddress.c_str(),
+                        (int)statusChanged,
+                        (int)countsChanged);
                 }
             }
 
@@ -815,6 +864,10 @@ void discoverSmartStallServices() {
                 if (idx >= 0) {
                     knownDevices.at(idx).hasLastStatus = true;
                     knownDevices.at(idx).lastStatusPublished = currentData.stallStatus;
+                    knownDevices.at(idx).hasLastCounts = true;
+                    knownDevices.at(idx).lastLimitSwitchPublished = currentData.sensorCounts.limit_switch_triggers;
+                    knownDevices.at(idx).lastCapTouchPublished = currentData.sensorCounts.cap_touch_triggers;
+                    knownDevices.at(idx).lastHallPublished = currentData.sensorCounts.hall_sensor_triggers;
                 }
             }
 
