@@ -4,15 +4,16 @@
  * Date: October 2025
  * 
  * This firmware implements a Bluetooth LE central device that:
- * - Scans for SmartStall peripheral devices
+ * - Scans for SmartStall (Hy Lock) peripheral devices
  * - Connects and downloads sensor data
  * - Publishes data to Particle cloud
+ * - Advertises as "SmartStallHub" so nearby Hy Lock devices can discover this hub
  */
 
 // Include Particle Device OS APIs
 #include "Particle.h"
 
-PRODUCT_VERSION(5);
+PRODUCT_VERSION(8);
 
 // Let Device OS manage the connection to the Particle Cloud
 SYSTEM_MODE(AUTOMATIC);
@@ -76,6 +77,13 @@ const BleUuid STALL_STATUS_CHAR_UUID("47d80a44-c552-422b-aa3b-d250ed04be37");
 const BleUuid BATTERY_VOLTAGE_CHAR_UUID("7d108dc9-4aaf-4a38-93e3-d9f8ff139f11");
 const BleUuid SENSOR_COUNTS_CHAR_UUID("3e4a9f12-7b5c-4d8e-a1b2-9c8d7e6f5a4b");
 
+// Hub presence beacon (non-connectable). Hy Locks / scanners can discover this device by
+// local name and/or this UUID. Must NOT reuse SMARTSTALL_SERVICE_UUID or the hub would
+// match itself while scanning for locks.
+const char *HUB_BLE_NAME = "SmartStallHub";
+const BleUuid HUB_PRESENCE_SERVICE_UUID("9f2e4c71-8b3a-4d6e-a5c1-2d7f8e9b0a14");
+const uint16_t HUB_ADV_INTERVAL_UNITS = 16000; // 10 s (units of 0.625 ms; max allowed is ~10.24 s)
+
 // BLE objects
 BlePeerDevice peer;
 BleCharacteristic stallStatusChar;
@@ -108,6 +116,38 @@ static void armBleCooldown() {
     }
 }
 
+// Presence-only advertising: scannable so active scanners get the hub UUID, but not
+// connectable — inbound links would collide with outbound Hy Lock polling on one radio.
+static void startHubPresenceAdvertising() {
+    if (BLE.advertising()) {
+        return;
+    }
+
+    BLE.setDeviceName(HUB_BLE_NAME);
+
+    BleAdvertisingData advData;
+    advData.appendLocalName(HUB_BLE_NAME);
+
+    BleAdvertisingData scanResponse;
+    scanResponse.appendServiceUUID(HUB_PRESENCE_SERVICE_UUID);
+
+    BLE.setAdvertisingParameters(HUB_ADV_INTERVAL_UNITS, 0, BleAdvertisingEventType::SCANABLE_UNDIRECTED);
+    int err = BLE.advertise(advData, scanResponse);
+    if (err == SYSTEM_ERROR_NONE) {
+        Log.info("Advertising hub presence as '%s'", HUB_BLE_NAME);
+    } else {
+        Log.warn("Failed to start hub presence advertising (%d)", err);
+    }
+}
+
+static void stopHubPresenceAdvertising() {
+    if (!BLE.advertising()) {
+        return;
+    }
+    BLE.stopAdvertising();
+    Log.info("Stopped hub presence advertising");
+}
+
 // Hub health metrics (persisted to ledger)
 struct HubMetrics {
     uint32_t scansStarted = 0;
@@ -135,7 +175,7 @@ struct DeviceInfo {
     uint16_t lastStatusPublished; // last status value we published
     bool hasLastCounts = false; // whether we have published counts before
     uint32_t lastLimitSwitchPublished = 0;
-    uint32_t lastCapTouchPublished = 0;
+    uint32_t lastHandActivationPublished = 0;
     uint32_t lastHallPublished = 0;
     // Older SmartStall firmware (pre-v1.2) may advertise NOTIFY; hub is read-only — skip to avoid stack asserts
     bool legacyProfileBlocked = false;
@@ -230,7 +270,7 @@ void registerOrUpdateDevice(const BleAddress &addr) {
         d.lastStatusPublished = 0;
         d.hasLastCounts = false;
         d.lastLimitSwitchPublished = 0;
-        d.lastCapTouchPublished = 0;
+        d.lastHandActivationPublished = 0;
         d.lastHallPublished = 0;
         knownDevices.append(d);
         devicesLedgerDirty = true;
@@ -306,7 +346,7 @@ int devicesScanned = 0;
 // Data structures matching SmartStall API
 struct SensorCounts {
     uint32_t limit_switch_triggers;
-    uint32_t cap_touch_triggers; // was ir_sensor_triggers; matches peripheral / BLUETOOTH_API.md
+    uint32_t hand_activation_triggers; // was cap_touch_triggers / ir_sensor_triggers
     uint32_t hall_sensor_triggers;
 };
 
@@ -401,7 +441,7 @@ static void writeUnifiedLedger(bool force) {
         last.set("battery_mv", (int)currentData.batteryVoltage);
         Variant counts;
         counts.set("limit_switch", (int64_t)currentData.sensorCounts.limit_switch_triggers);
-        counts.set("cap_touch", (int64_t)currentData.sensorCounts.cap_touch_triggers);
+        counts.set("hand_activation", (int64_t)currentData.sensorCounts.hand_activation_triggers);
         counts.set("hall_sensor", (int64_t)currentData.sensorCounts.hall_sensor_triggers);
         last.set("sensor_counts", counts);
         last.set("read_ts", (int64_t)currentData.timestamp);
@@ -471,6 +511,8 @@ void setup() {
     // Set up connection callbacks
     BLE.onConnected(onConnected);
     BLE.onDisconnected(onDisconnected);
+
+    startHubPresenceAdvertising();
     
     // Initialize data structure
     currentData.isValid = false;
@@ -478,7 +520,7 @@ void setup() {
     currentData.stallStatus = 0;
     currentData.batteryVoltage = 0;
     currentData.sensorCounts.limit_switch_triggers = 0;
-    currentData.sensorCounts.cap_touch_triggers = 0;
+    currentData.sensorCounts.hand_activation_triggers = 0;
     currentData.sensorCounts.hall_sensor_triggers = 0;
     
     Log.info("Starting BLE scan for SmartStall devices...");
@@ -516,6 +558,9 @@ void loop() {
 
     switch(currentState) {
         case HUB_SCANNING:
+            if (!hasPendingAddress && now >= bleQuietUntil && !BLE.advertising()) {
+                startHubPresenceAdvertising();
+            }
             // Avoid overlapping scan with pending connect or post-disconnect stack cooldown (assert risk)
             if (!hasPendingAddress && millis() >= bleQuietUntil && millis() - lastScanTime > 15000) {
                 Log.info("Opportunistic scan tick (light refresh)");
@@ -530,6 +575,7 @@ void loop() {
                 Log.info("Initiating deferred connection to %s", pendingStr.c_str());
                 hasPendingAddress = false; // consume it
                 expectingUserInitiatedDisconnect = false;
+                stopHubPresenceAdvertising();
                 BLE.stopScanning();
                 connectTargetAddress = pendingAddress;
                 connectAttemptIndex = 0;
@@ -623,7 +669,19 @@ void loop() {
 
 // Callback when a BLE device is found during scanning
 void onScanResultReceived(const BleScanResult &scanResult) {
+    // Ignore our own presence advertisements (controller may still report them)
+    if (scanResult.address() == BLE.address()) {
+        return;
+    }
+
     String deviceName = scanResult.advertisingData().deviceName();
+    if (deviceName.length() == 0) {
+        deviceName = scanResult.scanResponse().deviceName();
+    }
+    if (deviceName == HUB_BLE_NAME) {
+        return;
+    }
+
     hubMetrics.scanResultsSeen++;
     
     Log.info("Found device - Name: '%s', Address: %s, RSSI: %d", 
@@ -702,7 +760,7 @@ void onConnected(const BlePeerDevice &connectedPeer) {
     currentData.stallStatus = 0;
     currentData.batteryVoltage = 0;
     currentData.sensorCounts.limit_switch_triggers = 0;
-    currentData.sensorCounts.cap_touch_triggers = 0;
+    currentData.sensorCounts.hand_activation_triggers = 0;
     currentData.sensorCounts.hall_sensor_triggers = 0;
 }
 
@@ -845,7 +903,7 @@ void discoverSmartStallServices() {
                 bool statusChanged = (!d.hasLastStatus || d.lastStatusPublished != currentData.stallStatus);
                 bool countsChanged = (!d.hasLastCounts
                     || d.lastLimitSwitchPublished != currentData.sensorCounts.limit_switch_triggers
-                    || d.lastCapTouchPublished != currentData.sensorCounts.cap_touch_triggers
+                    || d.lastHandActivationPublished != currentData.sensorCounts.hand_activation_triggers
                     || d.lastHallPublished != currentData.sensorCounts.hall_sensor_triggers);
                 if (!statusChanged && !countsChanged) {
                     shouldPublish = false;
@@ -866,7 +924,7 @@ void discoverSmartStallServices() {
                     knownDevices.at(idx).lastStatusPublished = currentData.stallStatus;
                     knownDevices.at(idx).hasLastCounts = true;
                     knownDevices.at(idx).lastLimitSwitchPublished = currentData.sensorCounts.limit_switch_triggers;
-                    knownDevices.at(idx).lastCapTouchPublished = currentData.sensorCounts.cap_touch_triggers;
+                    knownDevices.at(idx).lastHandActivationPublished = currentData.sensorCounts.hand_activation_triggers;
                     knownDevices.at(idx).lastHallPublished = currentData.sensorCounts.hall_sensor_triggers;
                 }
             }
@@ -942,13 +1000,13 @@ void readAllCharacteristics() {
                 Log.info("Sensor counts read (%d bytes)", (int)count);
                 currentData.sensorCounts.limit_switch_triggers = 
                     sensorData[0] | (sensorData[1] << 8) | (sensorData[2] << 16) | (sensorData[3] << 24);
-                currentData.sensorCounts.cap_touch_triggers = 
+                currentData.sensorCounts.hand_activation_triggers = 
                     sensorData[4] | (sensorData[5] << 8) | (sensorData[6] << 16) | (sensorData[7] << 24);
                 currentData.sensorCounts.hall_sensor_triggers = 
                     sensorData[8] | (sensorData[9] << 8) | (sensorData[10] << 16) | (sensorData[11] << 24);
-                Log.info("Counts - Limit:%lu CapTouch:%lu Hall:%lu", 
+                Log.info("Counts - Limit:%lu HandActivation:%lu Hall:%lu", 
                     currentData.sensorCounts.limit_switch_triggers,
-                    currentData.sensorCounts.cap_touch_triggers,
+                    currentData.sensorCounts.hand_activation_triggers,
                     currentData.sensorCounts.hall_sensor_triggers);
                 return true; }
             Log.warn("Sensor counts read attempt %d failed (bytes=%d)", attempt + 1, (int)count);
@@ -997,7 +1055,7 @@ void publishSmartStallData() {
         "\"battery_v\":%.2f,"
         "\"sensor_counts\":{"
             "\"limit_switch\":%lu,"
-            "\"cap_touch\":%lu,"
+            "\"hand_activation\":%lu,"
             "\"hall_sensor\":%lu"
         "}"
         "}",
@@ -1009,7 +1067,7 @@ void publishSmartStallData() {
         currentData.batteryVoltage,
         currentData.batteryVoltage / 1000.0f,
         currentData.sensorCounts.limit_switch_triggers,
-        currentData.sensorCounts.cap_touch_triggers,
+        currentData.sensorCounts.hand_activation_triggers,
         currentData.sensorCounts.hall_sensor_triggers
     );
     
@@ -1031,6 +1089,7 @@ void resetConnection() {
     connectedDeviceAddress = "";
     currentData.isValid = false;
     armBleCooldown();
+    startHubPresenceAdvertising();
     
     Log.info("Connection reset, returning to scan mode");
 }

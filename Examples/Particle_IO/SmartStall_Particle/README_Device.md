@@ -286,12 +286,12 @@ Custom primary service UUID: `c56a1b98-6c1e-413a-b138-0e9f320c7e8b`
 ```c
 struct sensor_counts {
     uint32_t limit_switch_triggers;  // Door position switch activations
-    uint32_t cap_touch_triggers;     // Capacitive touch sensor detections
+    uint32_t hand_activation_triggers; // Hand activation detections
     uint32_t hall_sensor_triggers;   // Hall effect sensor changes
 };
 ```
 
-> **Note**: This field was previously named `ir_sensor_triggers`. It now tracks the MTCH101 capacitive touch sensor, which is the primary detection source. IR confirmation events are not separately counted.
+> **Note**: This field was previously named `ir_sensor_triggers`, then `cap_touch_triggers`. It now tracks hand activations from the MTCH101 capacitive touch sensor, which is the primary detection source. IR confirmation events are not separately counted.
 
 **For complete BLE integration details, see [BLUETOOTH_API.md](BLUETOOTH_API.md)**
 

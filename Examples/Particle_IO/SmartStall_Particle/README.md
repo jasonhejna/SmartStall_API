@@ -44,7 +44,7 @@ Characteristics:
 2. Battery Voltage (`7d108dc9-4aaf-4a38-93e3-d9f8ff139f11`)
    - Format: `uint16_t` millivolts
 3. Sensor Counts (`3e4a9f12-7b5c-4d8e-a1b2-9c8d7e6f5a4b`)
-   - Format: 3 × `uint32_t` (limit_switch, ir_sensor, hall_sensor)
+   - Format: 3 × `uint32_t` (limit_switch, hand_activation, hall_sensor)
 
 Each poll cycle resets characteristic handles before discovery to prevent accidental reuse across peers.
 
@@ -68,7 +68,7 @@ Occupancy mapping: 0/1/3/4 → non-occupied, 2/5 → occupied.
    "battery_v": 3.70,
    "sensor_counts": {
       "limit_switch": 150,
-      "ir_sensor": 89,
+      "hand_activation": 89,
       "hall_sensor": 145
    }
 }

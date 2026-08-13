@@ -98,12 +98,12 @@ float voltage_v = voltage_mv / 1000.0f;
 ```c
 struct sensor_counts {
     uint32_t limit_switch_triggers;  // Bytes 0-3: Door position switch activations
-    uint32_t cap_touch_triggers;     // Bytes 4-7: Capacitive touch sensor detections
+    uint32_t hand_activation_triggers; // Bytes 4-7: Hand activation detections
     uint32_t hall_sensor_triggers;   // Bytes 8-11: Magnetic field changes
 };
 ```
 
-> **Field rename notice**: The second field was previously named `ir_sensor_triggers`. It is now `cap_touch_triggers` and counts MTCH101 capacitive touch edge events (the primary detection source). IR confirmation events are not separately counted.
+> **Field rename notice**: The second field was previously named `ir_sensor_triggers`, then `cap_touch_triggers`. It is now `hand_activation_triggers` and counts MTCH101 capacitive touch edge events (the primary detection source). IR confirmation events are not separately counted.
 
 #### Detailed Field Descriptions:
 
@@ -113,9 +113,9 @@ struct sensor_counts {
 - **Use Cases**: Door usage frequency, mechanical wear tracking, maintenance scheduling
 - **Range**: 0 to 4,294,967,295
 
-**`cap_touch_triggers`** (uint32_t, little-endian)
+**`hand_activation_triggers`** (uint32_t, little-endian)
 - **Purpose**: Counts MTCH101 capacitive touch sensor edge events for user interaction tracking
-- **Incremented**: On every valid cap-touch edge (both LOW→HIGH and HIGH→LOW) that passes the lockout filter
+- **Incremented**: On every valid hand-activation edge (both LOW→HIGH and HIGH→LOW) that passes the lockout filter
 - **Use Cases**: User interaction analytics, proximity-based unlock frequency
 - **Range**: 0 to 4,294,967,295
 
@@ -131,7 +131,7 @@ struct sensor_counts {
 uint8_t data[12];
 // Parse little-endian values
 uint32_t limit_switch  = (data[3] << 24) | (data[2] << 16) | (data[1] << 8) | data[0];
-uint32_t cap_touch     = (data[7] << 24) | (data[6] << 16) | (data[5] << 8) | data[4];
+uint32_t hand_activation = (data[7] << 24) | (data[6] << 16) | (data[5] << 8) | data[4];
 uint32_t hall_sensor   = (data[11] << 24) | (data[10] << 16) | (data[9] << 8) | data[8];
 ```
 
@@ -252,6 +252,7 @@ The firmware implements intelligent flash write management to prevent conflicts 
 - **TX power control**: Advertising TX at 0 dBm; connection TX raised to +4 dBm via Nordic SoftDevice vendor HCI commands
 - **LE Coded PHY**: Requested on every new connection via HCI `LE Set PHY` command; falls back to 1M PHY if central does not support Coded PHY
 - **Extended advertising**: Optional support via `CONFIG_BT_EXT_ADV`; falls back to legacy advertising
+- **Field rename**: `sensor_counts.cap_touch_triggers` → `hand_activation_triggers` (bytes 4–7 unchanged)
 
 ### v1.1 — PCB rev. 2026-03-21
 - **Field rename**: `sensor_counts.ir_sensor_triggers` → `cap_touch_triggers` (bytes 4–7 now count MTCH101 capacitive touch edges)
