@@ -6,7 +6,7 @@ The SmartStall firmware exposes a Bluetooth Low Energy (BLE) GATT service that p
 
 ## Device Information
 
-- **Device Name**: `SmartStall`
+- **Device Name**: `HyLock`
 - **Protocol**: Bluetooth Low Energy (BLE) 5.0+
 - **Connection Type**: Single connection (one client at a time)
 - **Advertising**: Connectable, discoverable
@@ -140,7 +140,7 @@ uint32_t hall_sensor   = (data[11] << 24) | (data[10] << 16) | (data[9] << 8) | 
 ## Connection Management
 
 ### Advertising Parameters
-- **Advertising Name**: "SmartStall"
+- **Advertising Name**: "HyLock"
 - **Advertising Interval**: 40 ms min / 50 ms max (ADV_INT 64–80 × 0.625 ms)
 - **Discoverable**: Yes
 - **Connectable**: Yes
@@ -186,7 +186,7 @@ The firmware implements intelligent flash write management to prevent conflicts 
 
 #### 1. **Connection Management**
 ```pseudocode
-1. Scan for devices advertising "SmartStall"
+1. Scan for devices advertising "HyLock"
 2. Connect to device with service UUID c56a1b98-6c1e-413a-b138-0e9f320c7e8b
 3. Discover all characteristics
 4. Read values for Status and Sensor Counts characteristics

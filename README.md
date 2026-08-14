@@ -18,7 +18,7 @@ If you are integrating a custom hub (ESP32, Linux gateway, etc.), start with the
 ## Peripheral Overview
 
 Each SmartStall device is a Bluetooth Low Energy (BLE) peripheral advertising a custom primary service. The GATT service exposes:
-- BLE device name **SmartStall**
+- BLE device name **HyLock**
 - Stall lock **status** (enum values)
 - **Reference Switch** (mechanical position sensor)
 - **Battery voltage** (millivolts)
@@ -186,7 +186,7 @@ Additions (new characteristics or JSON fields) are introduced in a backward‑co
 
 ## BLE Advertisement
 
-- **GAP Device Name**: **`SmartStall`**
+- **GAP Device Name**: **`HyLock`**
 - The SmartStall peripheral advertises with:
   - Connectable mode
   - Its 128-bit service UUID
@@ -195,7 +195,7 @@ Additions (new characteristics or JSON fields) are introduced in a backward‑co
 
 ## Basic Peripheral Interaction Workflow (Custom Hubs)
 
-1. Scan for advertisements with Service UUID `c56a1b98-6c1e-413a-b138-0e9f320c7e8b` (optionally filter by name `SmartStall`).
+1. Scan for advertisements with Service UUID `c56a1b98-6c1e-413a-b138-0e9f320c7e8b` (optionally filter by name `HyLock`).
 2. Connect; perform service + characteristic discovery each session (avoid stale caching across multiple peripherals).
 3. Read required characteristics (`Stall Status`, `Reference Switch`, `Battery Voltage`, plus `Sensor Counts` if present).
 4. Disconnect promptly; repeat per device on a schedule informed by your throughput and latency needs.

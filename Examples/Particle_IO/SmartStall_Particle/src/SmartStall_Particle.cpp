@@ -13,7 +13,7 @@
 // Include Particle Device OS APIs
 #include "Particle.h"
 
-PRODUCT_VERSION(8);
+PRODUCT_VERSION(9);
 
 // Let Device OS manage the connection to the Particle Cloud
 SYSTEM_MODE(AUTOMATIC);
@@ -81,8 +81,9 @@ const BleUuid SENSOR_COUNTS_CHAR_UUID("3e4a9f12-7b5c-4d8e-a1b2-9c8d7e6f5a4b");
 // local name and/or this UUID. Must NOT reuse SMARTSTALL_SERVICE_UUID or the hub would
 // match itself while scanning for locks.
 const char *HUB_BLE_NAME = "SmartStallHub";
+const char *LOCK_BLE_NAME = "HyLock";
 const BleUuid HUB_PRESENCE_SERVICE_UUID("9f2e4c71-8b3a-4d6e-a5c1-2d7f8e9b0a14");
-const uint16_t HUB_ADV_INTERVAL_UNITS = 16000; // 10 s (units of 0.625 ms; max allowed is ~10.24 s)
+const uint16_t HUB_ADV_INTERVAL_UNITS = 3000;
 
 // BLE objects
 BlePeerDevice peer;
@@ -491,11 +492,14 @@ void setup() {
     
     // Initialize BLE
     BLE.on();
-    // Increase BLE transmit power to improve range (max +8 dBm on nRF52840)
-    if (BLE.setTxPower(8)) {
-        Log.info("BLE TX power set to +8 dBm");
+    // Request max TX power (+8 dBm is the highest value Device OS accepts).
+    // On RTL872x (M-SoM / P2) hal_ble_gap_set_tx_power() is a no-op through at least Device OS 6.3.3,
+    // so the radio stays at the platform default regardless of this call; it only takes effect on nRF52 builds.
+    int txPowerErr = BLE.setTxPower(8);
+    if (txPowerErr == SYSTEM_ERROR_NONE) {
+        Log.info("BLE TX power request accepted (+8 dBm)");
     } else {
-        Log.warn("Failed to set BLE TX power");
+        Log.warn("Failed to set BLE TX power (%d)", txPowerErr);
     }
     // Use 1M PHY for scanning only. SmartStall peripheral may request LE Coded on link; the stack negotiates
     // and falls back to 1M if needed — forcing coded scan has been associated with central instability on some builds.
@@ -710,8 +714,8 @@ void onScanResultReceived(const BleScanResult &scanResult) {
     
     // Check if this is a SmartStall device by name or service UUID
     bool isSmartStall = false;
-    if (deviceName == "SmartStall") {
-        Log.info("SmartStall device found by name!");
+    if (deviceName == LOCK_BLE_NAME) {
+        Log.info("HyLock device found by name!");
         isSmartStall = true;
     } else if (hasSmartStallService) {
         Log.info("SmartStall device found by service UUID!");
