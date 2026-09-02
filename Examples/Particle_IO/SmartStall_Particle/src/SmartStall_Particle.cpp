@@ -13,7 +13,7 @@
 // Include Particle Device OS APIs
 #include "Particle.h"
 
-PRODUCT_VERSION(9);
+PRODUCT_VERSION(10);
 
 // Let Device OS manage the connection to the Particle Cloud
 SYSTEM_MODE(AUTOMATIC);
@@ -76,6 +76,10 @@ const BleUuid SMARTSTALL_SERVICE_UUID("c56a1b98-6c1e-413a-b138-0e9f320c7e8b");
 const BleUuid STALL_STATUS_CHAR_UUID("47d80a44-c552-422b-aa3b-d250ed04be37");
 const BleUuid BATTERY_VOLTAGE_CHAR_UUID("7d108dc9-4aaf-4a38-93e3-d9f8ff139f11");
 const BleUuid SENSOR_COUNTS_CHAR_UUID("3e4a9f12-7b5c-4d8e-a1b2-9c8d7e6f5a4b");
+// Cumulative count (NVS-persisted, lifetime) of hands-free auto-locks where the bolt never reached
+// locked. READ-only, polled at the same cadence as the other 3 — see BLUETOOTH_API.md "4. Failed-Lock
+// Count Characteristic" (golden-image branch). Optional: older peripheral firmware may not expose it.
+const BleUuid FAILED_LOCK_COUNT_CHAR_UUID("9a3f5c21-8e4d-4b7a-b3c5-1f2e3d4c5b6a");
 
 // Hub presence beacon (non-connectable). Hy Locks / scanners can discover this device by
 // local name and/or this UUID. Must NOT reuse SMARTSTALL_SERVICE_UUID or the hub would
@@ -90,6 +94,7 @@ BlePeerDevice peer;
 BleCharacteristic stallStatusChar;
 BleCharacteristic batteryVoltageChar;
 BleCharacteristic sensorCountsChar;
+BleCharacteristic failedLockCountChar;
 
 // Deferred connection handling (avoid calling BLE.connect inside scan callback which may cause instability)
 bool hasPendingAddress = false;
@@ -162,9 +167,28 @@ struct HubMetrics {
     uint32_t profileRejected = 0; // pre-v1.2 NOTIFY profile or invalid GATT (skipped reads)
     uint32_t ledgerWritesHub = 0;
     uint32_t ledgerWritesDevices = 0;
+    // Heap health trend (cheap early-warning for fragmentation over weeks/months of uptime).
+    uint32_t lastFreeMemory = 0;
+    uint32_t minFreeMemory = 0xFFFFFFFF;
 };
 
 HubMetrics hubMetrics;
+
+// Hardware watchdog: recovers automatically (full MCU reset) if the application thread ever
+// stops making forward progress — e.g. a wedged/blocking call somewhere in the BLE stack — without
+// needing a manual power cycle. Cellular/cloud keep running on the separate system thread even
+// while the app thread is stuck, which is why the device stays "reachable" during such a hang.
+//
+// Watchdog.refresh() is called once per loop() iteration AND at safe boundaries between the
+// individual blocking BLE calls inside a single-shot poll (see discoverSmartStallServices() /
+// readAllCharacteristics()) — never from inside a single blocking call itself. This means a
+// genuinely wedged call (one that never returns) still trips the watchdog as intended, but the
+// *cumulative* time of several sequential calls that each complete slowly (marginal RF link,
+// retries, now 4 characteristics instead of 3) no longer falsely trips it. The timeout below only
+// needs to comfortably exceed the worst-case time for the single slowest span between two
+// refresh() boundaries, not the whole poll cycle. See:
+// https://docs.particle.io/reference/device-os/api/watchdog-hardware/watchdog-hardware/
+const unsigned long HUB_WATCHDOG_TIMEOUT_MS = 90000;
 
 // Device registry to track multiple known devices and poll them in a loop
 struct DeviceInfo {
@@ -178,6 +202,7 @@ struct DeviceInfo {
     uint32_t lastLimitSwitchPublished = 0;
     uint32_t lastHandActivationPublished = 0;
     uint32_t lastHallPublished = 0;
+    uint32_t lastFailedLockCountPublished = 0;
     // Older SmartStall firmware (pre-v1.2) may advertise NOTIFY; hub is read-only — skip to avoid stack asserts
     bool legacyProfileBlocked = false;
     unsigned long legacyProfileRetryAfterMs = 0;
@@ -220,8 +245,11 @@ static const char *validateV12ReadOnlyProfile() {
     if (!stallStatusChar.isValid() || !batteryVoltageChar.isValid() || !sensorCountsChar.isValid()) {
         return "missing required characteristics (status/battery/sensor_counts)";
     }
-    const BleCharacteristic *chars[] = { &stallStatusChar, &batteryVoltageChar, &sensorCountsChar };
+    // Failed-lock count is checked if present, but not required — older peripheral firmware
+    // (pre golden-image) may not expose it yet, and that must not block the other 3 reads.
+    const BleCharacteristic *chars[] = { &stallStatusChar, &batteryVoltageChar, &sensorCountsChar, &failedLockCountChar };
     for (const BleCharacteristic *ch : chars) {
+        if (!ch->isValid()) continue;
         uint32_t pr = (uint32_t)ch->properties();
         if (blePropHas(pr, BleCharacteristicProperty::NOTIFY)) {
             return "NOTIFY present (pre-v1.2 profile); hub does not subscribe";
@@ -273,6 +301,7 @@ void registerOrUpdateDevice(const BleAddress &addr) {
         d.lastLimitSwitchPublished = 0;
         d.lastHandActivationPublished = 0;
         d.lastHallPublished = 0;
+        d.lastFailedLockCountPublished = 0;
         knownDevices.append(d);
         devicesLedgerDirty = true;
         Log.info("Added new SmartStall device to registry (%d total): %s", knownDevices.size(), addr.toString().c_str());
@@ -356,6 +385,7 @@ struct SmartStallData {
     uint16_t stallStatus;
     uint16_t batteryVoltage;
     SensorCounts sensorCounts;
+    uint32_t failedLockCount; // lifetime NVS-persisted count; rising value = mechanical problem
     unsigned long timestamp;
     bool isValid;
 };
@@ -381,6 +411,14 @@ static void writeUnifiedLedger(bool force) {
     if (!force && !hubDue && !devicesLedgerDirty) return;
     if (!force && !okGap) return;
 
+    // Sample heap health every write — cheap early-warning for fragmentation trending toward
+    // exhaustion over weeks/months of continuous uptime, visible remotely without device logs.
+    uint32_t freeMem = (uint32_t)System.freeMemory();
+    hubMetrics.lastFreeMemory = freeMem;
+    if (freeMem < hubMetrics.minFreeMemory) {
+        hubMetrics.minFreeMemory = freeMem;
+    }
+
     Variant root;
     root.set("ts_ms", (int64_t)now);
     if (Time.isValid()) {
@@ -390,12 +428,16 @@ static void writeUnifiedLedger(bool force) {
     // Hub section
     Variant hub;
     hub.set("state", (int)currentState);
+    hub.set("uptime_s", (int64_t)System.uptime());
+    hub.set("reset_reason", (int)System.resetReason());
     Variant ble;
     ble.set("cooldown_ms", (int64_t)((now >= bleQuietUntil) ? 0 : (bleQuietUntil - now)));
     ble.set("connected", peer.connected());
     hub.set("ble", ble);
 
     Variant metrics;
+    metrics.set("free_memory", (int64_t)hubMetrics.lastFreeMemory);
+    metrics.set("min_free_memory", (int64_t)hubMetrics.minFreeMemory);
     metrics.set("scans_started", (int64_t)hubMetrics.scansStarted);
     metrics.set("scan_results_seen", (int64_t)hubMetrics.scanResultsSeen);
     metrics.set("smartstall_seen", (int64_t)hubMetrics.smartstallSeen);
@@ -427,6 +469,9 @@ static void writeUnifiedLedger(bool force) {
         if (d.hasLastStatus) {
             dv.set("last_status", (int)d.lastStatusPublished);
         }
+        if (d.hasLastCounts) {
+            dv.set("failed_locks", (int64_t)d.lastFailedLockCountPublished);
+        }
         dv.set("legacy_blocked", d.legacyProfileBlocked);
         dv.set("legacy_retry_after_ms", (int64_t)d.legacyProfileRetryAfterMs);
         devicesObj.set(key.c_str(), dv);
@@ -445,6 +490,7 @@ static void writeUnifiedLedger(bool force) {
         counts.set("hand_activation", (int64_t)currentData.sensorCounts.hand_activation_triggers);
         counts.set("hall_sensor", (int64_t)currentData.sensorCounts.hall_sensor_triggers);
         last.set("sensor_counts", counts);
+        last.set("failed_locks", (int64_t)currentData.failedLockCount);
         last.set("read_ts", (int64_t)currentData.timestamp);
         devicesSection.set("last_read", last);
     }
@@ -485,11 +531,43 @@ void discoverSmartStallServices();
 void readAllCharacteristics();
 void publishSmartStallData();
 void resetConnection();
+int cloudRestartDevice(String command);
+
+// Cloud-triggered restart (Particle.function "restart"). The actual System.reset() is deferred a
+// couple seconds and executed from loop() so the cloud call's return value has time to be sent
+// back before the M-SoM reboots (resetting synchronously inside the callback can drop the response).
+volatile bool cloudRestartPending = false;
+unsigned long cloudRestartRequestedAtMs = 0;
+const unsigned long CLOUD_RESTART_DELAY_MS = 2000;
+
+// Particle.function callback: POST /v1/devices/{id}/restart (any/no argument) reboots the M-SoM.
+int cloudRestartDevice(String command) {
+    if (cloudRestartPending) {
+        Log.info("Cloud restart already pending; ignoring duplicate request (arg=\"%s\")", command.c_str());
+        return 1;
+    }
+    Log.warn("Cloud restart requested via Particle.function (arg=\"%s\"); rebooting in %lu ms",
+        command.c_str(), CLOUD_RESTART_DELAY_MS);
+    cloudRestartPending = true;
+    cloudRestartRequestedAtMs = millis();
+    return 1;
+}
 
 // setup() runs once, when the device is first turned on
 void setup() {
     Log.info("SmartStall BLE Central Hub starting...");
-    
+
+    // Surface why we rebooted (helps confirm/monitor watchdog recoveries remotely without physical
+    // access to logs). Device OS also auto-publishes a "last_reset" cloud event once this feature
+    // is enabled. Note: on RTL872x (P2/Photon 2/M-SoM) this often reads back as NONE because it's
+    // not always safe to persist the reason to flash before an abrupt reset — best-effort only.
+    System.enableFeature(FEATURE_RESET_INFO);
+    Log.info("Boot reset reason: %d (data=%lu)", (int)System.resetReason(), (unsigned long)System.resetReasonData());
+
+    // Register cloud functions as early as possible (AUTOMATIC system mode sends registrations
+    // once setup() completes) — see https://docs.particle.io/reference/device-os/api/cloud-functions/particle-function/
+    Particle.function("restart", cloudRestartDevice);
+
     // Initialize BLE
     BLE.on();
     // Request max TX power (+8 dBm is the highest value Device OS accepts).
@@ -526,6 +604,19 @@ void setup() {
     currentData.sensorCounts.limit_switch_triggers = 0;
     currentData.sensorCounts.hand_activation_triggers = 0;
     currentData.sensorCounts.hall_sensor_triggers = 0;
+    currentData.failedLockCount = 0;
+
+    // Start the hardware watchdog last, after setup's other (fast) init work is done, so we don't
+    // risk it expiring before the first refresh() call in loop(). See constant comment above for
+    // why this is the primary fix for "cellular stayed up but BLE polling silently stopped".
+    int wdErr = Watchdog.init(WatchdogConfiguration().timeout(HUB_WATCHDOG_TIMEOUT_MS));
+    if (wdErr == SYSTEM_ERROR_NONE) {
+        Watchdog.start();
+        Watchdog.refresh();
+        Log.info("Hardware watchdog armed (timeout=%lu ms)", HUB_WATCHDOG_TIMEOUT_MS);
+    } else {
+        Log.error("Failed to initialize hardware watchdog (%d) - device will NOT auto-recover from a hang!", wdErr);
+    }
     
     Log.info("Starting BLE scan for SmartStall devices...");
     currentState = HUB_SCANNING;
@@ -535,6 +626,18 @@ void setup() {
 // loop() runs over and over again, as quickly as it can execute.
 void loop() {
     unsigned long now = millis();
+
+    // Refresh the hardware watchdog every time we make it back around the loop. Deliberately NOT
+    // refreshed from inside blocking BLE calls (discoverSmartStallServices() et al.) — if one of
+    // those ever truly wedges, we want the watchdog to fire and reboot us rather than stay silently
+    // stuck until someone notices and power-cycles the device.
+    Watchdog.refresh();
+
+    // Honor a pending cloud-requested restart before anything else, regardless of hub state.
+    if (cloudRestartPending && (now - cloudRestartRequestedAtMs) >= CLOUD_RESTART_DELAY_MS) {
+        Log.warn("Executing cloud-requested restart now");
+        System.reset();
+    }
 
     maybeInitLedgers();
     writeUnifiedLedger(false);
@@ -766,6 +869,7 @@ void onConnected(const BlePeerDevice &connectedPeer) {
     currentData.sensorCounts.limit_switch_triggers = 0;
     currentData.sensorCounts.hand_activation_triggers = 0;
     currentData.sensorCounts.hall_sensor_triggers = 0;
+    currentData.failedLockCount = 0;
 }
 
 // Callback when disconnected from a BLE device
@@ -805,6 +909,7 @@ void discoverSmartStallServices() {
     stallStatusChar = BleCharacteristic();
     batteryVoltageChar = BleCharacteristic();
     sensorCountsChar = BleCharacteristic();
+    failedLockCountChar = BleCharacteristic();
     
     Log.info("Discovering SmartStall services and characteristics...");
     
@@ -818,6 +923,10 @@ void discoverSmartStallServices() {
         delay(200);
     }
     Log.info("Found %d services total", services.size());
+    // Boundary between blocking BLE calls, not inside one — safe to refresh here (see comment on
+    // HUB_WATCHDOG_TIMEOUT_MS). Keeps a slow-but-successful service discovery from eating into the
+    // budget for the characteristic discovery/reads that follow.
+    Watchdog.refresh();
     
     bool serviceFound = false;
     for (const BleService& service : services) {
@@ -827,11 +936,13 @@ void discoverSmartStallServices() {
             // Discover its characteristics
             Vector<BleCharacteristic> characteristics = peer.discoverCharacteristicsOfService(service);
             Log.info("Found %d characteristics in SmartStall service", characteristics.size());
+            Watchdog.refresh();
             for (const BleCharacteristic& characteristic : characteristics) {
                 BleUuid cu = characteristic.UUID();
                 if (cu == STALL_STATUS_CHAR_UUID) { stallStatusChar = characteristic; Log.info("✓ Stall status characteristic"); }
                 else if (cu == BATTERY_VOLTAGE_CHAR_UUID) { batteryVoltageChar = characteristic; Log.info("✓ Battery voltage characteristic"); }
                 else if (cu == SENSOR_COUNTS_CHAR_UUID) { sensorCountsChar = characteristic; Log.info("✓ Sensor counts characteristic"); }
+                else if (cu == FAILED_LOCK_COUNT_CHAR_UUID) { failedLockCountChar = characteristic; Log.info("✓ Failed lock count characteristic"); }
                 else { Log.info("Other characteristic: %s", cu.toString().c_str()); }
             }
             break;
@@ -846,6 +957,7 @@ void discoverSmartStallServices() {
     Log.info("- Stall Status Char Valid: %s", stallStatusChar.isValid() ? "YES" : "NO");
     Log.info("- Battery Voltage Char Valid: %s", batteryVoltageChar.isValid() ? "YES" : "NO");
     Log.info("- Sensor Counts Char Valid: %s", sensorCountsChar.isValid() ? "YES" : "NO");
+    Log.info("- Failed Lock Count Char Valid: %s", failedLockCountChar.isValid() ? "YES (optional)" : "NO (optional, older firmware)");
 
     const char *profileRejectReason = nullptr;
     bool didRead = false;
@@ -908,7 +1020,8 @@ void discoverSmartStallServices() {
                 bool countsChanged = (!d.hasLastCounts
                     || d.lastLimitSwitchPublished != currentData.sensorCounts.limit_switch_triggers
                     || d.lastHandActivationPublished != currentData.sensorCounts.hand_activation_triggers
-                    || d.lastHallPublished != currentData.sensorCounts.hall_sensor_triggers);
+                    || d.lastHallPublished != currentData.sensorCounts.hall_sensor_triggers
+                    || d.lastFailedLockCountPublished != currentData.failedLockCount);
                 if (!statusChanged && !countsChanged) {
                     shouldPublish = false;
                     Log.info("Status and counts unchanged for %s; skipping publish",
@@ -930,6 +1043,7 @@ void discoverSmartStallServices() {
                     knownDevices.at(idx).lastLimitSwitchPublished = currentData.sensorCounts.limit_switch_triggers;
                     knownDevices.at(idx).lastHandActivationPublished = currentData.sensorCounts.hand_activation_triggers;
                     knownDevices.at(idx).lastHallPublished = currentData.sensorCounts.hall_sensor_triggers;
+                    knownDevices.at(idx).lastFailedLockCountPublished = currentData.failedLockCount;
                 }
             }
 
@@ -993,6 +1107,23 @@ void readAllCharacteristics() {
         return false;
     };
 
+    auto readWithRetry32 = [&](BleCharacteristic &ch, const char *label, uint32_t &outVal)->bool {
+        if (!ch.isValid()) { Log.warn("%s characteristic invalid", label); return false; }
+        uint8_t buf[8] = {0};
+        const int EXPECT = 4;
+        const int MAX_RETRIES = 3;
+        for (int attempt = 0; attempt < MAX_RETRIES; ++attempt) {
+            ssize_t count = ch.getValue(buf, EXPECT);
+            if (count >= EXPECT) {
+                outVal = (uint32_t)buf[0] | ((uint32_t)buf[1] << 8) | ((uint32_t)buf[2] << 16) | ((uint32_t)buf[3] << 24);
+                Log.info("%s read (%d bytes) value=%lu", label, (int)count, (unsigned long)outVal);
+                return true; }
+            Log.warn("%s read attempt %d failed (bytes=%d)", label, attempt + 1, (int)count);
+            delay(150);
+        }
+        return false;
+    };
+
     auto readSensorCountsRetry = [&](BleCharacteristic &ch)->bool {
         if (!ch.isValid()) { Log.warn("Sensor counts characteristic invalid"); return false; }
         uint8_t sensorData[16] = {0};
@@ -1023,18 +1154,42 @@ void readAllCharacteristics() {
     if (okStatus) {
         Log.info("Stall Status Name: %s", getStatusString(currentData.stallStatus));
     }
+    // Refresh between each characteristic's read+retry loop (a boundary between blocking calls,
+    // never inside one) so a slow-but-successful read doesn't eat into the next one's budget and
+    // falsely trip the watchdog. See comment on HUB_WATCHDOG_TIMEOUT_MS.
+    Watchdog.refresh();
+
     bool okBattery = readWithRetry16(batteryVoltageChar, "BatteryVoltage", currentData.batteryVoltage);
     if (okBattery) {
         Log.info("Battery Voltage: %u mV (%.2f V)", (unsigned)currentData.batteryVoltage, currentData.batteryVoltage / 1000.0f);
     }
+    Watchdog.refresh();
+
     bool okCounts = readSensorCountsRetry(sensorCountsChar);
+    Watchdog.refresh();
+
+    // Failed-lock count is optional (older peripheral firmware may not expose it yet). If the
+    // characteristic wasn't discovered, don't fail the whole poll cycle for it.
+    bool okFailedLocks = true;
+    if (failedLockCountChar.isValid()) {
+        okFailedLocks = readWithRetry32(failedLockCountChar, "FailedLockCount", currentData.failedLockCount);
+        if (okFailedLocks && currentData.failedLockCount > 0) {
+            Log.warn("Device %s has %lu lifetime failed hands-free auto-lock(s) - possible mechanical issue",
+                currentData.deviceAddress.c_str(), (unsigned long)currentData.failedLockCount);
+        }
+    } else {
+        currentData.failedLockCount = 0;
+        Log.info("Failed lock count characteristic not present on this device (older firmware); skipping");
+    }
+    Watchdog.refresh();
     
-    if (!(okStatus && okBattery && okCounts)) {
-        Log.warn("One or more characteristic reads failed (status=%d battery=%d counts=%d)", okStatus, okBattery, okCounts);
+    if (!(okStatus && okBattery && okCounts && okFailedLocks)) {
+        Log.warn("One or more characteristic reads failed (status=%d battery=%d counts=%d failed_locks=%d)",
+            okStatus, okBattery, okCounts, okFailedLocks);
     }
     
     currentData.timestamp = Time.now();
-    currentData.isValid = (okStatus && okBattery && okCounts);
+    currentData.isValid = (okStatus && okBattery && okCounts && okFailedLocks);
 }
 
 // Publish complete SmartStall data to Particle cloud
@@ -1061,7 +1216,8 @@ void publishSmartStallData() {
             "\"limit_switch\":%lu,"
             "\"hand_activation\":%lu,"
             "\"hall_sensor\":%lu"
-        "}"
+        "},"
+        "\"failed_locks\":%lu"
         "}",
         currentData.deviceAddress.c_str(),
         currentData.timestamp,
@@ -1072,7 +1228,8 @@ void publishSmartStallData() {
         currentData.batteryVoltage / 1000.0f,
         currentData.sensorCounts.limit_switch_triggers,
         currentData.sensorCounts.hand_activation_triggers,
-        currentData.sensorCounts.hall_sensor_triggers
+        currentData.sensorCounts.hall_sensor_triggers,
+        currentData.failedLockCount
     );
     
     Log.info("Publishing SmartStall data: %s", jsonData.c_str());
